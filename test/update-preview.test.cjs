@@ -117,3 +117,69 @@ test('processImages 抛错时后续 PreviewPost 仍执行（C10 健壮性）', a
     cleanup(w);
   }
 });
+
+// ── 回归：滑动窗口模式的派发顺序（2026-09-28）──────────────────────────────
+// 背景：v2 局部锚定接入时被放在了窗口判断**之前**。局部锚定只能看见"当前已渲染的那一片
+//   窗口"，而它在窗口内总能找到锚点并返回 true ⇒ 窗口逻辑永远轮不到 ⇒ 焦点行不再更新
+//   ⇒ 窗口卡死在首个切片。实测（8 万行 / 3.9MB 文档）：编辑器滚到 76000 行，预览仍停在
+//   1~1202 行，两栏内容完全不相干。
+// 下面三条把「窗口模式必须优先、非窗口模式仍走局部锚定」钉死，防止再被短路。
+async function makeWindowedEditor() {
+  const { w } = await buildEnv();
+  const ed = await waitForEditor(w);
+  loadUnifiedRenderer(w);
+  ed.viewMode = 'preview';           // 大文档 + 预览模式 → windowed（previewWindow 非 null）
+  ed.cm.setValue(largeDoc());
+  await ed.updatePreview();
+  return { w, ed };
+}
+
+test('窗口模式：_syncEditorToPreview 必须命中窗口分支，不得被局部锚定短路', async () => {
+  const { w, ed } = await makeWindowedEditor();
+  try {
+    assert.ok(ed.previewWindow, '前置条件：应进入窗口模式');
+    let winCalls = 0, localCalls = 0;
+    ed._syncEditorToPreviewWindow = () => { winCalls++; };
+    // 故意返回 true —— 修复前正是它把窗口逻辑挡在了后面
+    ed._syncEditorToPreviewLocal = () => { localCalls++; return true; };
+    ed._syncEditorToPreview();
+    assert.equal(winCalls, 1, '窗口模式必须调用 _syncEditorToPreviewWindow');
+    assert.equal(localCalls, 0, '窗口模式不得先走局部锚定');
+  } finally {
+    cleanup(w);
+  }
+});
+
+test('窗口模式：_syncPreviewToEditor 必须命中窗口分支，不得被局部锚定短路', async () => {
+  const { w, ed } = await makeWindowedEditor();
+  try {
+    assert.ok(ed.previewWindow, '前置条件：应进入窗口模式');
+    let winCalls = 0, localCalls = 0;
+    ed._syncPreviewToEditorWindow = () => { winCalls++; };
+    ed._syncPreviewToEditorLocal = () => { localCalls++; return true; };
+    ed._syncPreviewToEditor();
+    assert.equal(winCalls, 1, '窗口模式必须调用 _syncPreviewToEditorWindow');
+    assert.equal(localCalls, 0, '窗口模式不得先走局部锚定');
+  } finally {
+    cleanup(w);
+  }
+});
+
+test('非窗口模式：仍由局部锚定接管（防止修过头把 v2 关掉）', async () => {
+  const { w } = await buildEnv();
+  const ed = await waitForEditor(w);
+  loadUnifiedRenderer(w);
+  try {
+    ed.cm.setValue('# 标题\n\n正文。');
+    await ed.updatePreview();
+    assert.equal(ed.previewWindow, null, '前置条件：小文档不进窗口模式');
+    let winCalls = 0, localCalls = 0;
+    ed._syncEditorToPreviewWindow = () => { winCalls++; };
+    ed._syncEditorToPreviewLocal = () => { localCalls++; return true; };
+    ed._syncEditorToPreview();
+    assert.equal(localCalls, 1, '非窗口模式应由局部锚定处理');
+    assert.equal(winCalls, 0, '非窗口模式不应调用窗口分支');
+  } finally {
+    cleanup(w);
+  }
+});

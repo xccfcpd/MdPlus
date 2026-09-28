@@ -313,6 +313,9 @@
       },
       // 编辑器 → 预览：按源码行局部插值。返回 true 表示已处理（false 则交回旧实现兜底）。
       _syncEditorToPreviewLocal(editorTop) {
+        // 大文档滑动窗口模式：预览里只有一片切片，全文档锚定不适用 —— 明确交回窗口逻辑。
+        // 与派发处的「窗口优先」形成双保险，防止日后重排顺序时又被短路（见该处注释）。
+        if (this.previewWindow) return false;
         const cmInfo = this.cm.getScrollInfo();
         const { scrollHeight, clientHeight } = this.preview;
         const top = (editorTop != null) ? editorTop : cmInfo.top;
@@ -371,6 +374,7 @@
       },
       // 预览 → 编辑器：按内容位置局部插值。返回 true 表示已处理。
       _syncPreviewToEditorLocal(previewTop) {
+        if (this.previewWindow) return false;   // 同上：窗口模式交回 _syncPreviewToEditorWindow
         const cmInfo = this.cm.getScrollInfo();
         const { scrollHeight, clientHeight } = this.preview;
         const pvTop = (previewTop != null) ? previewTop : this.preview.scrollTop;
@@ -444,8 +448,12 @@
       // 编辑器 → 预览同步（旧路径：全文档位置表 + 逐行插值）
       // v2 局部锚定可用时由 _syncEditorToPreviewLocal 短路接管，这里只作锚点不足时的兜底。
       _syncEditorToPreview(editorTop) {
-        if (this._syncEditorToPreviewLocal(editorTop)) return;
+        // ⚠ 顺序关键：大文档滑动窗口模式必须**优先**交给窗口逻辑，不能放在局部锚定之后。
+        //   原因：局部锚定只能看见「当前已渲染的那一片窗口」，而它在窗口内总能找到锚点并
+        //   返回 true —— 一旦排在前面，窗口逻辑就永远轮不到，焦点行不再更新，窗口卡死在
+        //   首个切片。实测（8 万行文档）：编辑器滚到 76000 行，预览仍停在 1~1202 行。
         if (this.previewWindow) { this._syncEditorToPreviewWindow(); return; }
+        if (this._syncEditorToPreviewLocal(editorTop)) return;
         this._computedPosition();
   
         const editorList = this._editorElementList;
@@ -492,8 +500,10 @@
       // previewTop 可选：指定预览滚动位置作为来源；省略则读当前预览 scrollTop。
       // 切换模式时用它传入「已保存的预览位置」，避免依赖此刻可能不可靠的实时值。
       _syncPreviewToEditor(previewTop) {
-        if (this._syncPreviewToEditorLocal(previewTop)) return;   // v2：局部按需锚定
+        // ⚠ 同上：窗口模式优先。局部锚定只看得到当前窗口，排在前面会让
+        //   _syncPreviewToEditorWindow（窗口内 scrollTop → 源码行）永远不执行。
         if (this.previewWindow) { this._syncPreviewToEditorWindow(); return; }
+        if (this._syncPreviewToEditorLocal(previewTop)) return;   // v2：局部按需锚定
         this._computedPosition();
   
         const previewList = this._previewElementList;
