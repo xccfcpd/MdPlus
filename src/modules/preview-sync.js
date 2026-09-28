@@ -335,8 +335,39 @@
         const eSpan = bE - aE;
         let t = eSpan > 0 ? (top - aE) / eSpan : 0;
         if (!(t >= 0)) t = 0; else if (t > 1) t = 1;           // 夹取：防 NaN / 越界外推
-        const target = aP + t * (bP - aP);
-        this.preview.scrollTop = Math.max(0, Math.min(target, scrollHeight - clientHeight));
+        let target = aP + t * (bP - aP);
+        const vMax = Math.max(0, scrollHeight - clientHeight);
+
+        // ── 末尾区段：最后一屏内由「顶部对齐」平滑过渡到「底部对齐」──────────────
+        // 为什么必须过渡：预览内容比编辑器矮（行高不同）⇒ 顶部对齐的映射会先于编辑器触底
+        //   就达到预览可滚上限；此时「连续 + 单调 + 不越界 + 精确遵守锚点」四者不可兼得，
+        //   硬夹（scrollTop = vMax）是该约束下的唯一解 —— 代价是最后约一屏内容永远对不上
+        //   （实测偏差 ≈ −clientHeight，即"编辑器还有一屏、预览已贴底"）。
+        //   这里改为在尾部改用「底部对齐」：让编辑器视口底行与预览视口底行对应 ——
+        //   底部必然对齐，顶部残差降到两栏"每屏行数差"这一固有量级（≈ 0.25 屏）。
+        // 权重 w 由编辑器「剩余可滚动距离」给出，保证：
+        //   · 离底部还有一屏时 w=0 → **与旧行为逐位相同**（中前段零改动）；
+        //   · 编辑器到底时 w=1 → bTarget 恰为 vMax（与上方"编辑器到底"早返回一致，无跳变）。
+        const distToBottom = cmInfo.height - (top + clientHeight);
+        if (distToBottom < clientHeight) {
+          const w = 1 - Math.max(0, distToBottom) / Math.max(1, clientHeight);
+          const bottomLine = this.cm.lineAtHeight(top + clientHeight, 'local') + 1;
+          const pb = this._anchorPairByLine(bottomLine);
+          let bTarget = target;
+          if (pb) {
+            const bEa = this.cm.heightAtLine(pb[0].line - 1, 'local');
+            const bEb = this.cm.heightAtLine(pb[1].line - 1, 'local');
+            const bPa = pb[0].el.getBoundingClientRect().top - base;
+            const bPb = pb[1].el.getBoundingClientRect().top - base;
+            const bSpan = bEb - bEa;
+            let tb = bSpan > 0 ? ((top + clientHeight) - bEa) / bSpan : 0;
+            if (!(tb >= 0)) tb = 0; else if (tb > 1) tb = 1;
+            bTarget = bPa + tb * (bPb - bPa) - clientHeight;     // 底行对齐 ⇒ 视口顶即为此值
+          }
+          target = (1 - w) * target + w * bTarget;
+        }
+
+        this.preview.scrollTop = Math.max(0, Math.min(target, vMax));
         return true;
       },
       // 预览 → 编辑器：按内容位置局部插值。返回 true 表示已处理。
