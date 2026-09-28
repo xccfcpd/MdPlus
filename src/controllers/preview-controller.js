@@ -1,0 +1,612 @@
+// P2-1 PreviewController（ADR-3 Strangler facade）
+//
+// 把 updatePreview 的编排逻辑 + N7 表遗留的 5 个虚拟窗口方法收编到单一 facade，
+// 使上帝对象 app.js 的预览渲染职责有明确的归属边界。迁移期 app.js 保留薄委托
+// （this.updatePreview / this._focusPreviewToLine / ...），全迁完再删（见 P2-1 计划）。
+//
+// 设计要点：
+//  - 构造函数持有 app 实例引用（this.app），所有 app 侧字段/方法经 this.app 访问；
+//  - 控制器自有的方法（_focusPreviewToLine / _renderPreviewWindowBlock /
+//    _updateVirtualScrollMetrics / _syncPreviewVirtualScroll / _buildWindowLineTops）
+//    经 this 访问，互相调用也走 this；
+//  - 真·全局（PreviewWindow / UnifiedRenderer / TauriApi / PreviewPost / CodeBlock /
+//    ImageProcessor / hljs）沿用 window 全局，不在此重复声明；
+//  - app.js 顶层 const 的预览常量（脚本作用域、跨脚本不可见）在此复制一份，
+//    与 app.js 保持同源同值（如后续调整需同步两侧）。
+//
+// 整文件包在 IIFE 内：经典 <script> 的顶层 const/class 会进入「全局词法环境」且跨脚本共享，
+// 若与 app.js 的同名 const 撞车会触发重复声明 SyntaxError（拼接测试 / 生产均会崩）。
+// 用函数作用域隔离，只经 window.PreviewController 暴露，跨独立脚本 / 拼接脚本 / harness eval 都不冲突。
+
+(function () {
+  // 预览常量：与 src/app.js 顶部保持一致（脚本作用域不可跨脚本共享，故此处复制）。
+  const MAX_PREVIEW_LINES = 5000;
+  const MAX_PREVIEW_CHARS = 4 * 1024 * 1024;
+  const HEAD_RENDER_CHAR_CAP = 1.5 * 1024 * 1024;
+  const PREVIEW_WINDOW_LINES = 1200;  // 窗口源码行数上限
+  const PREVIEW_WINDOW_LEAD = 200;    // 焦点行前预留行数（让焦点不至于贴顶）
+
+  class PreviewController {
+    constructor(app) {
+      this.app = app;
+    }
+
+    // 文档化 facade API：render() 即原 updatePreview；setDark/refresh 供后续批次调用。
+    setDark(dark) {
+      this.app.isDark = !!dark;
+    }
+
+    refresh() {
+      return this.render();
+    }
+
+    async render(suppressLoading = false, contentIn) {
+      // 防御：若被勾选抑制标记触发（应已被 debounceUpdatePreview 拦截），直接轻量返回，杜绝全量重渲染
+      if (this.app._suppressNextPreviewRerender) {
+        this.app._suppressNextPreviewRerender = false;
+        this.app.updateWordCount();
+        this.app.updateOutline();
+        return;
+      }
+    const gen = ++this.app._renderGeneration;
+    // contentIn：调用方已知编辑器内容时传入，省掉本函数内部一次 O(N) 的 cm.getValue()
+    // （切标签 / 防抖键入都会走到这里）。只接受字符串，其余一律回退为自行读取。
+    const _contentIn = (typeof contentIn === 'string') ? contentIn : null;
+    let needLoad = false;
+    const _tab = this.app.activeTab;
+    const _tabKind = _tab ? _tab.kind : 'markdown';
+    // 图片：应用内预览面板显示。
+    // 注意：Tauri v2 的 convertFileSrc 返回 asset://localhost/... ，但本应用 CSP 的 img-src
+    // 未放行 asset: 协议，直接用会被 WebView 拦截导致「图片打不开」。因此统一走
+    // fetchImageAsBase64 拿 base64 data URI（与 markdown 内嵌图片一致，data: 已被 CSP 放行）。
+    if (_tabKind === 'image') {
+      this.app.preview.style.position = '';
+      this.app.preview.style.padding = '';
+      const imgPath = _tab.filePath || '';
+      const alt = this.app.escapeAttr(_tab.name || '');
+      if (!imgPath) {
+        this.app.preview.innerHTML = '<div class="image-error">' + this.app.escapeHtml(this.app.t('formatUnsupported')) + '</div>';
+        if (this.app._resumeScroll) this.app._resumeScroll();
+        return;
+      }
+      const lower = imgPath.toLowerCase();
+      const mime = lower.endsWith('.gif') ? 'image/gif'
+        : lower.endsWith('.svg') ? 'image/svg+xml'
+        : lower.endsWith('.webp') ? 'image/webp'
+        : (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) ? 'image/jpeg'
+        : 'image/png';
+      const fallbackSrc = (typeof TauriApi !== 'undefined' && TauriApi.convertFileSrc) ? TauriApi.convertFileSrc(imgPath) : imgPath;
+      try {
+        if (typeof TauriApi !== 'undefined' && typeof TauriApi.fetchImageAsBase64 === 'function') {
+          const base64 = await TauriApi.fetchImageAsBase64({ url: imgPath });
+          const dataUri = 'data:' + mime + ';base64,' + base64;
+          this.app.preview.innerHTML = '<img class="image-viewer" src="' + this.app.escapeAttr(dataUri) + '" alt="' + alt + '">';
+        } else {
+          this.app.preview.innerHTML = '<img class="image-viewer" src="' + this.app.escapeAttr(fallbackSrc) + '" alt="' + alt + '">';
+        }
+      } catch (e) {
+        console.warn('[preview] 图片加载失败：', imgPath, e);
+        this.app.preview.innerHTML = '<img class="image-viewer" src="' + this.app.escapeAttr(fallbackSrc) + '" alt="' + alt + '">';
+      }
+      if (this.app._resumeScroll) this.app._resumeScroll();
+      return;
+    }
+    // 明文：按原始文本显示（不做 Markdown 渲染）
+    if (_tabKind === 'text') {
+      const content = (_contentIn !== null) ? _contentIn : this.app.cm.getValue();
+      this.app.preview.style.position = '';
+      this.app.preview.style.padding = '';
+      this.app.preview.innerHTML = '<pre class="plaintext-view">' + this.app.escapeHtml(content) + '</pre>';
+      if (this.app._resumeScroll) this.app._resumeScroll();
+      return;
+    }
+    try {
+      // 调用方已给出内容时不重复序列化整篇（见上 contentIn）
+      const content = (_contentIn !== null) ? _contentIn : this.app.cm.getValue();
+        // 行数按换行符扫描计数：大文档下 split('\n') 会生成 N 个子串（明显开销），这里只数不分配。
+        // 用原生 indexOf 数换行（比逐字符 charCodeAt 快一个量级）：本函数每次重渲染都会走到。
+        let totalLines = 1;
+        { let at = -1; while ((at = content.indexOf('\n', at + 1)) !== -1) totalLines++; }
+        // _previewForceFull：导出等场景临时要求**全量渲染**（见 export.js 的 _preparePreviewForExport）。
+        // 不加这个开关，大文档会走下面的滑动窗口只渲染约 1200 行，而导出基于
+        // preview.cloneNode(true) → 导出的 HTML/PDF/Word 只会包含那一段（2026-09-23 用户报障）。
+        const isLarge = !this.app._previewForceFull &&
+          (content.length > MAX_PREVIEW_CHARS || totalLines > MAX_PREVIEW_LINES);
+
+        // 大文档重渲染耗时明显：在加载层可见时由本函数接管其生命周期（引用计数），
+        // 仅在「显式打开/切换/视图切换/大纲跳转」等非滚动、非打字触发的重渲染时显示 loading；
+        // 滚动驱动（_previewScrollDriven）与打字（suppressLoading）不显示，避免闪烁
+        needLoad = isLarge && !suppressLoading && !this.app._previewScrollDriven;
+        if (needLoad) this.app._beginPaneLoad();
+
+        // 超大文档：预览只渲染「围绕焦点的一段源码」（滑动窗口），避免整篇同步解析/渲染卡死主线程，
+        // 同时保证任意位置（大纲跳转 / 滚动）都可在预览中落点。
+        let renderContent = content;
+        this.app._previewTruncated = false;
+        if (isLarge) {
+          const focus = Number.isFinite(this.app._previewFocusLine) ? this.app._previewFocusLine : 0;
+          // 整篇只 split 一次：窗口计算与切片共用这条行数组（原先同一份内容被 split 两次，
+          // 每次分配「长度 = 行数」的字符串数组，10k 行文档下就是数万个子串）（2026-09-26）。
+          const lines = content.split('\n');
+          const win = PreviewWindow.computePreviewWindow(content, focus, {
+            maxLines: MAX_PREVIEW_LINES,
+            lead: PREVIEW_WINDOW_LEAD,
+            windowLines: PREVIEW_WINDOW_LINES,
+            lines,
+          });
+          this.app.previewWindow = win;
+          this.app._previewSliceOffset = win.start;
+          this.app._previewVirtual = (this.app.viewMode === 'preview');
+          const slice = lines.slice(win.start, win.end).join('\n');
+          renderContent = slice.length > HEAD_RENDER_CHAR_CAP ? slice.slice(0, HEAD_RENDER_CHAR_CAP) : slice;
+          this.app._previewTruncated = true;
+        } else {
+          this.app.previewWindow = null;
+          this.app._previewSliceOffset = 0;
+          this.app._previewVirtual = false;
+        }
+
+
+        const hasToc = content.includes('[TOC]') || content.includes('[toc]');
+        let tocHtml = '';
+        if (hasToc) {
+          // 单槽缓存：TOC 只依赖**全文**，与窗口切片无关。纯预览大文档靠滚动驱动重渲染时
+          // 内容并未改变 → 直接复用上次结果，省掉一次「整篇内容过 IPC + Rust 侧重解析」。
+          // 内容一变字符串即不相等，缓存自然失效，不需要额外版本号（2026-09-26）。
+          const tocCached = this.app._tocCache;
+          if (tocCached && tocCached.content === content) {
+            tocHtml = tocCached.html;
+          } else {
+            tocHtml = await TauriApi.generateToc({ content });
+            if (gen !== this.app._renderGeneration) return;
+            this.app._tocCache = { content, html: tocHtml };
+          }
+        }
+
+        // 仅在 loading 遮罩可见时，让出主线程两帧确保遮罩先绘制（避免大文档同步渲染期间“无 loading 白屏”）；普通打字刷新不额外延迟
+        const loadingEl = document.getElementById('pane-loading');
+        if (loadingEl && !loadingEl.classList.contains('hidden')) {
+          await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        }
+
+        // P0-0d 产物韧性：unified-bundle.js 缺失/加载失败时，这里原本是裸 ReferenceError
+        // （"UnifiedRenderer is not defined"），对使用者毫无指引。改抛可操作错误，
+        // 由 P0-1 的全局兜底渲染成错误条。
+        if (typeof UnifiedRenderer === 'undefined' || !UnifiedRenderer || typeof UnifiedRenderer.renderMarkdown !== 'function') {
+          throw new Error('渲染器未构建或加载失败（src/lib/unified-bundle.js），请运行 npm run build:renderer');
+        }
+        // 按 tab 渲染缓存（惰性渲染）：（同一 tab + 内容 + 影响渲染的设置）未变时，
+        // 复用上次 renderMarkdown 的输出，跳过耗时的 markdown 解析 —— 切回未改内容的标签秒开。
+        // 大文档同样生效：切 tab 时 _previewFocusLine 复位为 0 → 窗口切片固定，以「切片内容」
+        // 为键即可命中（滚动/打字改变切片自然 miss，按需重渲染）。此前大文档不缓存，
+        // 每次切回都全量同步解析切片，是「快速切 tab 界面锁死数秒」的主要放大器（2026-09-25）。
+        if (!this._previewCache) this._previewCache = new Map();
+        const _renderSig = [
+          this.app.settings.softBreaks,
+          this.app.settings.tabSize,
+          this.app.settings.extendedSyntax,
+          this.app.settings.equationSectionNumbering ? 'section' : 'global',
+        ].join('|');
+        const _cacheKey = _renderSig + ' ' + renderContent;
+        // 二级缓存：tab → (切片键 → HTML)。命中即把它提到最新（Map 迭代序 = 插入序，即 LRU）。
+        // 原先每个 tab 只存「最后一次渲染的那一片」，滚动窗口来回移动（或打字后回退）就必然
+        // 整片重解析；改为每个 tab 保留最近几片，来回滚动即可命中（P2-8，2026-09-26）。
+        const _tabCache = _tab ? this._previewCache.get(_tab) : null;
+        const _cached = _tabCache ? _tabCache.get(_cacheKey) : null;
+        let html;
+        if (_cached != null) {
+          html = _cached;
+          _tabCache.delete(_cacheKey);
+          _tabCache.set(_cacheKey, _cached);
+        } else {
+          // 过代即刻退出：快速连点标签时，旧代际不必再执行耗时的同步 renderMarkdown
+          if (gen !== this.app._renderGeneration) return;
+          // equationNumbering：'section' 时公式按章节编号（2.1），否则全文连续编号（默认）。
+          html = UnifiedRenderer.renderMarkdown(renderContent, {
+            softBreaks: this.app.settings.softBreaks,
+            tabSize: this.app.settings.tabSize,
+            extendedSyntax: this.app.settings.extendedSyntax,
+            equationNumbering: this.app.settings.equationSectionNumbering ? 'section' : 'global',
+          });
+          if (_tab) {
+            let _sliceCache = this._previewCache.get(_tab);
+            if (!_sliceCache) { _sliceCache = new Map(); this._previewCache.set(_tab, _sliceCache); }
+            _sliceCache.set(_cacheKey, html);
+            // 每个 tab 只留最近 3 片：滚动窗口来回移动时，命中的基本就是相邻这几片；
+            // 超出即淘汰最旧（Map 迭代序 = 插入序）。
+            while (_sliceCache.size > 3) _sliceCache.delete(_sliceCache.keys().next().value);
+            // 再对整体封顶：tab 数上限 12 + 全部切片总字节上限 24MB（HTML 字符串可达数百 KB~MB，
+            // 仅按条数封顶会保留过多）。
+            let _total = 0;
+            for (const _m of this._previewCache.values()) {
+              for (const [_k, _h] of _m) _total += _k.length + (_h ? _h.length : 0);
+            }
+            while (this._previewCache.size > 12 || _total > 24 * 1024 * 1024) {
+              const _oldestTab = this._previewCache.keys().next().value;
+              if (_oldestTab === undefined) break;
+              const _m = this._previewCache.get(_oldestTab);
+              for (const [_k, _h] of _m) _total -= _k.length + (_h ? _h.length : 0);
+              this._previewCache.delete(_oldestTab);
+            }
+          }
+        }
+        if (gen !== this.app._renderGeneration) return;
+
+        let finalHtml = html;
+        if (tocHtml) {
+          finalHtml = finalHtml.replace(/<p[^>]*data-source-line="(\d+)"[^>]*>\[TOC\]<\/p>/gi, '<div class="toc-wrapper" data-source-line="$1">' + tocHtml + '</div>');
+        }
+
+        // 内嵌 base64 图片改为按内容缓存的 Blob URL，避免每次重渲染重复解码（大文档多图时是关键性能点）
+        // 打开"保护窗口"：这段期间新建的 blob URL 还没进 DOM，不能被 LRU 淘汰/撤销（否则图片会裂）
+        this.app._imageURLBuilding = true;
+        // 无内联图片时跳过整段正则扫描（纯文本/公式文档常见），省一次全串正则
+        if (finalHtml.indexOf('data:image/') !== -1) {
+          finalHtml = finalHtml.replace(/data:image\/[^;]+;base64,[A-Za-z0-9+/=]+/g, (m) => this.app.getCachedImageURL(m));
+        }
+
+        // 滑动窗口：渲染的是切片后的源码，需把 data-source-line 还原为绝对行号（与编辑区一致），
+        // 否则大纲锚点 / 滚动定位会错位
+        if (this.app.previewWindow && this.app._previewSliceOffset > 0) {
+          const off = this.app._previewSliceOffset;
+          finalHtml = finalHtml.replace(/data-source-line="(\d+)"/g, (m, n) => `data-source-line="${parseInt(n, 10) + off}"`);
+        }
+
+        // 内容守卫（2026-09-26）：按本次渲染的 HTML 预判各后处理是否有活可干，免去每次
+        // 重渲染在整棵预览 DOM 上反复 querySelectorAll / TreeWalker。语义等价 ——
+        // 某类子串不存在时，对应选择器必为空（或该段处理本身就是空操作），结论不变。
+        const hasPre = finalHtml.indexOf('<pre') !== -1;
+        const hasDetails = finalHtml.indexOf('<details') !== -1;
+        const hasCheckbox = finalHtml.indexOf('checkbox') !== -1;
+        const hasHeading = /<h[1-6][\s>]/.test(finalHtml);
+        const hasFootnote = finalHtml.indexOf('footnote-ref') !== -1;
+        const hasDiagramCtn = finalHtml.indexOf('diagram-container') !== -1;
+        const hasImg = finalHtml.indexOf('<img') !== -1;
+
+        this.app._canScroll.editor = false;
+        this.app._canScroll.preview = false;
+        if (this.app._previewVirtual && this.app.previewWindow) {
+          this._renderPreviewWindowBlock(finalHtml, this.app.previewWindow, totalLines);
+        } else {
+          this.app.preview.style.position = '';
+          this.app.preview.style.padding = '';
+          this.app.preview.innerHTML = finalHtml;
+        }
+        // 新内容已入 DOM：本批次新建的 blob URL 现在可以被 img[src] 找到，关闭保护窗口
+        //（保护窗口用于避免在字符串构建期就撤销尚未入 DOM 的图片 URL —— 审计发现，2026-09-24）
+        this.app._imageURLBuilding = false;
+        if (this.app._imageURLPending && this.app._imageURLPending.size) this.app._imageURLPending.clear();
+
+        // 新内容已入 DOM：此刻上一批容器才真正脱离文档，回收它们的图表资源
+        // （ECharts 实例 / ResizeObserver / 引擎内部引用）—— 否则长会话内存只增不减，
+        // 表现为「用久了莫名卡顿、要重启才恢复」。只清脱离的那些，在 DOM 中的实例不动。
+        // 注意：**两条分支都要调**。虚拟窗口（纯预览 + 大文档）走 _renderPreviewWindowBlock，
+        // 它同样会整体替换窗口内容（滚动切片重渲染），此前漏调 → ECharts 实例与其
+        // ResizeObserver 永不释放（审计发现，2026-09-24）。
+        const DR = (typeof DiagramRenderers !== 'undefined') ? DiagramRenderers : null;
+        if (DR && typeof DR.disposeDetachedDiagrams === 'function') {
+          // 无图表时跳过整棵 DOM 的 .diagram-container 查询；但**注册表非空时必须执行** ——
+          // 上一代容器已脱离文档，全靠这里回收，漏调即内存只增不减（2026-09-26）。
+          const needRecycle = hasDiagramCtn
+            || (typeof DR.hasRegisteredDiagrams !== 'function' || DR.hasRegisteredDiagrams());
+          if (needRecycle) {
+            try { DR.disposeDetachedDiagrams(this.app.preview); } catch (e) { console.warn('[preview] dispose diagrams error:', e); }
+          }
+        }
+
+        // 图表「源码 → 占位」：**同步**执行，必须早于下面任何 await（processImages 等）。
+        // 否则那段等待期间预览里是**源码**，随后才被图替换 —— 用户看到的
+        // 「一会儿代码、一会儿图」正是这么来的（见 preview-post.js 的两阶段说明）。
+        let diagramPrep = null;
+        try {
+          diagramPrep = PreviewPost.prepareDiagramPlaceholders(this.app.preview, {
+            isDark: this.app.isDark,
+            mermaidCache: this.app._mermaidCache,
+            html: finalHtml,
+          });
+        } catch (e) { console.warn('[preview] Diagram prepare error:', e); }
+
+        // 后处理选项（提到这里：下面的**同步**定型阶段要用）
+        const postOpts = {
+          t: (k) => this.app.t(k),
+          isDark: this.app.isDark,
+          escapeHtml: (s) => this.app.escapeHtml(s),
+          escapeAttr: (s) => this.app.escapeAttr(s),
+          headingToId: (s) => this.app.headingToId(s),
+          mermaidCache: this.app._mermaidCache,
+          // 供各后处理器做「本次有没有活可干」的子串预判（见 preview-post.js 的 opts.html 守卫）
+          html: finalHtml,
+        };
+
+        // 代码块「定型」也必须在同一个**同步**阶段做完：高亮（hljs）+ 行号 + 复制按钮。
+        // 否则要等到 processImages / 图表渲染那些 await 之后才做，用户先看到的是**朴素代码**
+        // （无高亮、无行号），随后才变成最终样式 —— 这就是"所有代码都在闪"的来源（不只图表块）。
+        // 此刻 <pre> 的状态：
+        //   · 原生引擎（ECharts / WaveDrom / Graphviz / TikZ / plot / Markmap）已在上一步换成
+        //     占位容器，不会被这里碰到；
+        //   · mermaid 系仍是 <pre><code class="language-mermaid">，由两者的既有规则跳过
+        //     （code-block.js 跳过 language-(math|mermaid|katex)；另外还显式跳过
+        //     pre.diagram-src-pending —— 它们的源码要在渲染阶段被引擎原样读取）。
+        // 内容守卫：无 <pre> 时整段代码后处理（复制按钮 + 高亮/行号）直接跳过，
+        // 免去每次重渲染对整棵 DOM 的两次 `pre code` 查询（2026-09-26）。
+        if (hasPre) {
+          try { PreviewPost.addCopyButtons(this.app.preview, postOpts); } catch (e) { console.warn('[preview] Copy btn error:', e); }
+          try {
+            CodeBlock.processCodeBlocks(this.app.preview, {
+              hljs,
+              cache: this.app._hljsCache,
+              lineNumbers: this.app.preview.classList.contains('code-line-numbers'),
+            });
+          } catch (e) { console.warn('[preview] Code block error:', e); }
+        }
+
+        // 超大文档：顶部全局横幅提示（不塞进预览内容，避免随滚动/重渲染消失）
+        if (this.app._previewTruncated) {
+          // totalLines 复用上方已算好的值（避免再次 split 整篇内容）
+          const key = this.app.activeTab ? (this.app.activeTab.filePath || ('untitled:' + this.app.tabs.indexOf(this.app.activeTab))) : 'none';
+          this.app.showLargeFileNotice(key, totalLines, content.length);
+          this.app._previewTruncated = false;
+        } else {
+          this.app.hideLargeFileNotice();
+        }
+
+        // 折叠型 admonition（???）**不在**强制展开范围内：??? 的语义就是默认收起。
+        // 本行早于 admonition 存在（自 app.js 经 b24b227 搬迁而来，未曾考虑 ??? 语义），
+        // 原样会把 ??? 与 ???+ 拉平成「都展开」；排除 data-admonition 后二者恢复区分。
+        // Markdown 里手写的原生 <details> 仍保持既有「渲染后展开」行为，不做改动。
+        // 注意：??? 内的 ECharts / Markmap 在 display:none 下量不到宽高，故
+        // processDiagrams 渲染图表时会临时展开其祖先 <details>（见 preview-post.js）。
+        if (hasDetails) this.app.preview.querySelectorAll('details:not([open]):not([data-admonition])').forEach(el => el.open = true);
+        // 任务列表 checkbox：remark-gfm 默认输出 disabled 不可交互，渲染后移除 disabled 使其可点击
+        if (hasCheckbox) this.app.preview.querySelectorAll('input[type="checkbox"][disabled]').forEach(cb => cb.removeAttribute('disabled'));
+
+        // 其余**同步**后处理也在这里做完：emoji / 数学 / 缩写 / 脚注 / 标题锚点。
+        // 它们只读写 DOM 文本、与图片内联没有依赖关系，提前后浏览器一次绘制就是最终形态；
+        // 顺带让图表渲染（最慢的一环）可以在下面与图片内联**并行**跑。
+        try { PreviewPost.processEmojiShortcodes(this.app.preview, postOpts); } catch (e) { console.warn('[preview] Emoji error:', e); }
+        // 无 `$` = 无公式：整段 KaTeX 后处理（TreeWalker 保护 + renderMathInElement 全 DOM 扫描）
+        // 全部跳过 —— 纯文本/代码/图表文档每次重渲染都省一次全 DOM 遍历（2026-09-26）。
+        try { if (finalHtml.indexOf('$') !== -1) PreviewPost.processMath(this.app.preview, postOpts); } catch (e) { console.warn('[preview] Math error:', e); }
+        try { PreviewPost.processAbbreviations(this.app.preview, postOpts); } catch (e) { console.warn('[preview] Abbr error:', e); }
+        // 内容守卫：无脚注引用时跳过整棵 DOM 的 .footnote-ref / .footnote-backref 查询（2026-09-26）
+        if (hasFootnote) { try { this.app.processFootnotes(); } catch (e) { console.warn('[preview] Footnotes error:', e); } }
+        if (hasHeading) { try { PreviewPost.processHeadings(this.app.preview, postOpts); } catch (e) { console.warn('[preview] Headings error:', e); } }
+
+        // 图表渲染（Mermaid + 原生引擎）**立刻启动**，与下面的图片内联并行：
+        // 命中缓存的图已在同步阶段复原，这里只渲染没缓存过的；await 放在图片内联之后。
+        // 第 4 参是「代际过期」判定：本函数是即发即忘的，旧一代在 await 之间恢复后绝不能再动
+        // 新一代的 DOM（否则会把新图按旧主题重画、或把新一代的占位摘掉 → 源码复现）
+        const diagramRender = PreviewPost.renderDiagramPlaceholders(
+          this.app.preview, diagramPrep, postOpts, () => gen !== this.app._renderGeneration);
+        // 提前 return 的分支（generation 失效）不会 await 它 —— 先挂一个空 catch，
+        // 避免变成 unhandled rejection（全局红条），也避免"被抛弃的渲染"在后台继续改 DOM。
+        diagramRender.catch(() => {});
+
+        try { await this.app.processImages(hasImg); } catch (e) { console.warn('[preview] Images error:', e); }
+        if (gen !== this.app._renderGeneration) { this.app._resumeScroll(); return; }
+        try { await diagramRender; } catch (e) { console.warn('[preview] Diagram render error:', e); }
+        if (gen !== this.app._renderGeneration) { this.app._resumeScroll(); return; }
+        // 高亮 / 行号 / 复制按钮已在**同步**阶段完成（见上方「代码块定型」），这里只剩按需滚动。
+
+        // 代码块按需滚动：CSS 默认 overflow-y:hidden（避免 Windows always-show 滚动条
+        // 轨道在短代码块上也出现），只有内容真的超出 max-height 时才显式设 auto（必须
+        // 显式 'auto'，不能清空让 CSS 接管——CSS 已是 hidden，清空后还是 hidden）。
+        // 代码块按需滚动：仅当设置「代码块滚动条」开启时生效；关闭时由 CSS(.code-no-scroll)撑开高度
+        // `.code-scroll` 由上面的 CodeBlock 生成；无 <pre> 时必然一个都没有，跳过整棵 DOM 查询（2026-09-26）
+        if (hasPre && !(this.app.settings && this.app.settings.codeScroll === false)) {
+          // 两趟处理：先只读收集、再批量只写。原先是「读 scrollHeight/clientHeight → 写 style」
+          // 交替执行，每个代码块各触发一次强制布局（几十上百个块时是明显卡顿源，2026-09-26）。
+          // 判定准确性不变：代码块高度由 max-height 封顶，兄弟块出现的滚动条不会改变本块结果。
+          const needAuto = [];
+          const needHidden = [];
+          this.app.preview.querySelectorAll('.code-scroll').forEach((el) => {
+            if (el.scrollHeight > el.clientHeight + 1) needAuto.push(el);
+            else needHidden.push(el);
+          });
+          for (const el of needAuto) el.style.overflowY = 'auto';
+          for (const el of needHidden) if (el.style.overflowY !== 'hidden') el.style.overflowY = 'hidden';
+        }
+
+        // 等待浏览器完成布局后再测量元素位置
+        await new Promise(r => requestAnimationFrame(r));
+        if (gen !== this.app._renderGeneration) { this.app._resumeScroll(); return; }
+
+        // 滑动窗口模式：构建「源码行 → 预览像素」映射，并把预览滚动定位到焦点行；
+        // 不走整篇滚动同步（预览只含窗口片段，1:1 映射无意义）
+        if (this.app.previewWindow) {
+          this._buildWindowLineTops();
+          if (this.app._previewVirtual) this._updateVirtualScrollMetrics();
+          // 滚动驱动的重渲染保留当前 scrollTop（内容按 ℓ*avg 线性连续，无需回弹）；
+          // 仅大纲跳转 / 打开文件等显式跳转才贴顶定位
+          if (!this.app._previewScrollDriven) this._focusPreviewToLine(this.app._previewFocusLine);
+          this.app._previewScrollDriven = false;
+          requestAnimationFrame(() => {
+            if (gen === this.app._renderGeneration) this.app._resumeScroll();
+          });
+          return;
+        }
+
+        // 重建滚动同步数据（blocks + 预览子元素）；传入已取到的 content，省一次 cm.getValue()
+        this.app.rebuildScrollSync(content);
+
+        // 恢复预览滚动位置（逐行密集插值）；预览发起的编辑（复选框勾选）已保存位置，跳过以免被重算覆盖
+        if (this.app.settings.scrollSync && this.app._editorElementList && this.app._editorElementList.length > 1) {
+          const cmInfo = this.app.cm.getScrollInfo();
+          const top = cmInfo.top;
+
+          if (top <= 0.5) {
+            this.app.preview.scrollTop = 0;
+          } else if (top + cmInfo.clientHeight >= cmInfo.height - 0.5) {
+            this.app.preview.scrollTop = Math.max(0, this.app.preview.scrollHeight - this.app.preview.clientHeight);
+          } else {
+            let idx = -1;
+            for (let i = 0; i < this.app._editorElementList.length; i++) {
+              if (top < this.app._editorElementList[i]) {
+                idx = i - 1;
+                break;
+              }
+            }
+            if (idx < 0) idx = 0;
+            if (idx < this.app._editorElementList.length - 1) {
+              const editorStart = this.app._editorElementList[idx];
+              const editorEnd = this.app._editorElementList[idx + 1];
+              const previewStart = this.app._previewElementList[idx];
+              const previewEnd = this.app._previewElementList[idx + 1];
+              if (editorEnd > editorStart) {
+                const ratio = (top - editorStart) / (editorEnd - editorStart);
+                this.app.preview.scrollTop = previewStart + ratio * (previewEnd - previewStart);
+              }
+            }
+          }
+        } else {
+          const maxScroll = Math.max(this.app.preview.scrollHeight - this.app.preview.clientHeight, 0);
+          if (this.app.preview.scrollTop > maxScroll) this.app.preview.scrollTop = maxScroll;
+        }
+        requestAnimationFrame(() => {
+          if (gen === this.app._renderGeneration) this.app._resumeScroll();
+        });
+      } catch (error) {
+        if (gen !== this.app._renderGeneration) return;
+        this.app._resumeScroll();
+        const msg = String(error).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        // 用 class 而非内联 style：内联命名色（color: red）会被导出时的 DOM→docx 颜色收集
+        // 读到并原样交给 docx，构造 TextRun 时抛 Invalid hex value 导致整篇导出失败（2026-09-26）。
+        // 样式统一放 styles.css 的 .preview-error（样式表里的颜色不进入内联 style，不参与收集）。
+        this.app.preview.innerHTML = `<p class="preview-error">预览错误: ${msg}</p>`;
+      } finally {
+        // 渲染收尾时间戳：供「代码块按需滚动」的 MutationObserver 兜底逻辑跳过本批变动 ——
+        // 上面已同步做过同一件事、且此刻布局才定型，重复遍历整棵预览只是白付一次强制布局（P2-9b）。
+        this.app._lastRenderAt = Date.now();
+        if (needLoad) this.app._endPaneLoad();
+      }
+    }
+
+    // 构建窗口内 [源码行(1-based), 相对预览内容顶部像素] 的有序映射
+    _buildWindowLineTops() {
+      const pRect = this.app.preview.getBoundingClientRect();
+      const arr = [];
+      this.app.preview.querySelectorAll('[data-source-line]').forEach((el) => {
+        const ln = parseInt(el.dataset.sourceLine, 10);
+        if (isNaN(ln)) return;
+        const rect = el.getBoundingClientRect();
+        arr.push([ln, rect.top - pRect.top + this.app.preview.scrollTop]);
+      });
+      arr.sort((a, b) => a[0] - b[0]);
+      this.app._windowLineTops = arr;
+    }
+
+    // 把预览滚动定位到指定源码行（0-based），使其靠近顶部并保留上方上下文
+    _focusPreviewToLine(line) {
+      if (!Number.isFinite(line)) line = 0; // N22 ③：读取点归一化，NaN/undefined 焦点不污染定位
+      if (!this.app._windowLineTops || !this.app._windowLineTops.length) return;
+      const target = line + 1;
+      let bestTop = this.app._windowLineTops[0][1];
+      let bestLine = this.app._windowLineTops[0][0];
+      for (const [ln, top] of this.app._windowLineTops) {
+        if (ln <= target && ln > bestLine) { bestLine = ln; bestTop = top; }
+      }
+      const maxScroll = Math.max(this.app.preview.scrollHeight - this.app.preview.clientHeight, 0);
+      this.app.preview.scrollTop = Math.max(0, Math.min(bestTop - 24, maxScroll));
+    }
+
+    // 纯预览模式大文档：把窗口片段渲染到「撑满全文高度的占位 + 绝对定位块」中，
+    // 使原生滚动条代表整篇文档，用户可平滑滚动 / 拖到任意位置查看全文（虚拟滚动）。
+    // 平均行高恒定（首次渲染后校准一次），故 scrollTop ↔ 源码行比例精确，与 avg 估算无关。
+    _renderPreviewWindowBlock(finalHtml, win, totalLines) {
+      // totalLines 由调用方 render() 传入（它已用 charCodeAt 零分配地数过一遍）；
+      // 原先这里为了取长度又把整篇内容 split('\n') 了一次（2026-09-26）。
+      const lines = Number.isFinite(totalLines) ? totalLines : 1;
+      const avg = this.app._avgLineHeight || 22;
+      const estTotal = lines * avg;
+      const blockTop = win.start * avg;
+      this.app.preview.style.position = 'relative';
+      this.app.preview.style.padding = '0';
+      this.app.preview.innerHTML =
+        `<div class="pv-spacer" style="position:absolute;top:0;left:0;width:100%;height:${estTotal}px;"></div>` +
+        `<div class="pv-block" style="position:absolute;top:${blockTop}px;left:0;right:0;padding:16px 24px;box-sizing:border-box;">${finalHtml}</div>`;
+    }
+
+    // 首次渲染后根据已渲染窗口的真实行高校准平均行高（仅一次，之后恒定），
+    // 并据此重设占位高度（此时通常位于头部，scrollTop≈0，无视觉跳动）。
+    _updateVirtualScrollMetrics() {
+      if (!this.app._previewVirtual || !this.app.previewWindow) return;
+      if (this.app._avgLineHeight == null) {
+        const arr = this.app._windowLineTops;
+        if (arr && arr.length >= 2) {
+          const first = arr[0], last = arr[arr.length - 1];
+          const dh = last[1] - first[1];
+          const dl = last[0] - first[0];
+          if (dl > 0) {
+            const avg = dh / dl;
+            if (avg > 1 && avg < 500) this.app._avgLineHeight = avg;
+          }
+        }
+        if (this.app._avgLineHeight == null) this.app._avgLineHeight = 22;
+        const spacer = this.app.preview.querySelector('.pv-spacer');
+        if (spacer) spacer.style.height = (this.app.cm.lineCount() * this.app._avgLineHeight) + 'px';
+      }
+    }
+
+    // 纯预览模式虚拟滚动：预览滚动时按 scrollTop 估算当前视口顶行（锚定行），
+    // 若超出当前窗口缓冲区则 debounce 重渲染相邻窗口（拖到任意位置均渲染对应内容）。
+    // 重渲染使用最新 scrollTop 反推锚定行，避免滚动期间位置过期导致抖动。
+    _syncPreviewVirtualScroll() {
+      if (!this.app._previewVirtual || !this.app.previewWindow) return;
+      const win = this.app.previewWindow;
+      const total = this.app.cm.lineCount();
+      // 视口顶行优先用**实测**的「源码行 → 像素」映射（_buildWindowLineTops）二分求得。
+      // 为什么不用 scrollTop / 平均行高：含大图 / 表格 / 图表时平均行高会被拉偏，
+      // 估算出的行号可能一下子偏出窗口边界，于是**稍一滚动就被判定越界并重渲染**
+      // （用户报障「屏幕一滚动马上就重新渲染」）。实测映射与真实布局一致，不会误判。
+      let anchor = null;
+      const tops = this.app._windowLineTops;
+      if (tops && tops.length) {
+        const y = this.app.preview.scrollTop;
+        let lo = 0, hi = tops.length - 1, best = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (tops[mid][1] <= y) { best = mid; lo = mid + 1; } else { hi = mid - 1; }
+        }
+        anchor = tops[best][0];
+      }
+      if (anchor == null) {
+        const avg = this.app._avgLineHeight || 22;
+        anchor = Math.round(this.app.preview.scrollTop / avg);
+      }
+      anchor = Math.max(0, Math.min(total - 1, anchor));
+      if (anchor >= win.start + PREVIEW_WINDOW_LEAD && anchor <= win.end - PREVIEW_WINDOW_LEAD) return;
+      if (this.app._virtualRenderTimer) return;
+      this.app._virtualRenderTimer = setTimeout(() => {
+        this.app._virtualRenderTimer = null;
+        // 用最新 scrollTop 重新求一次锚定行（同上：优先实测映射，避免滚动期间位置过期）
+        let a2 = null;
+        const tops2 = this.app._windowLineTops;
+        if (tops2 && tops2.length) {
+          const y2 = this.app.preview.scrollTop;
+          let lo2 = 0, hi2 = tops2.length - 1, best2 = 0;
+          while (lo2 <= hi2) {
+            const mid2 = (lo2 + hi2) >> 1;
+            if (tops2[mid2][1] <= y2) { best2 = mid2; lo2 = mid2 + 1; } else { hi2 = mid2 - 1; }
+          }
+          a2 = tops2[best2][0];
+        }
+        if (a2 == null) {
+          const avg2 = this.app._avgLineHeight || 22;
+          a2 = Math.round(this.app.preview.scrollTop / avg2);
+        }
+        a2 = Math.max(0, Math.min(this.app.cm.lineCount() - 1, a2));
+        this.app._previewFocusLine = a2;
+        this.app._previewScrollDriven = true; // 滚动驱动：重渲染后保留当前 scrollTop，避免回弹
+        this.app.updatePreview();
+      }, 120);
+    }
+  }
+
+  // 双导出（N29 互斥式）：浏览器挂 window.PreviewController；node（契约/单元）走 module.exports。
+  if (typeof window !== 'undefined' && typeof module === 'undefined') {
+    window.PreviewController = PreviewController;
+  }
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { PreviewController };
+  }
+})();

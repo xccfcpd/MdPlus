@@ -1,0 +1,226 @@
+// 大纲（目录）抽取：从 app.js 的 updateOutline 拆出纯计算与渲染部分。
+// 设计：纯函数不依赖 DOM 或 this，依赖通过 opts 注入（headingToId / escapeHtml），
+// 与 preview-post.js 的注入风格一致，降低改动爆炸半径。
+//   - extractHeadings(content, { headingToId }): 从 markdown 文本提取标题（跳过代码块、解析 #、去重 id）
+//   - buildOutlineTree(headings): 按层级组织成树
+//   - renderOutlineHtml(tree, { escapeHtml }): 生成大纲 DOM 的 HTML 字符串
+
+// 完整清理标题中的 Markdown 内联语法，仅用于显示（面包屑 / 大纲文字）。
+// 与生成 id 的轻量清理（仅去 [*`~[]）不同：这里进一步剥离链接括号、行内代码
+// 反引号、强调/删除线标记、尾随 # 等，使显示文字更干净。
+// 注意：HTML 标签（<...>）不在此删除，交由渲染层转义为文字，避免误删正常尖括号内容。
+// 行内数学的判定：**必须与 unified-renderer.js 的 looksLikeMath 完全一致**。
+// 为什么大纲需要它：渲染侧会把「像数学」的 $...$ 换成 <!--MATHBLOCK_n--> 注释节点，
+// 而注释**不参与** heading slug → 含公式的标题 DOM id 里没有公式；若大纲把 $...$ 的字符算进去，
+// 两边 id 就对不上（大纲/锚点/面包屑点击静默失效 —— 审计发现，2026-09-25）。
+function looksLikeMath(inner) {
+  const t = inner.trim();
+  if (!t) return false;
+  if (/[\\{}_^&#@=+\-*/|<>°±×÷≤≥≠≈∞∈∪∩⊂⊃∑∏∫√′″']/.test(t)) return true;
+  if (/^[A-Za-z\u0370-\u03FF\u1F00-\u1FFF]$/.test(t)) return true;
+  return false;
+}
+
+// 丢弃「会被渲染侧当成公式」的 $...$（其余按字面量保留）。规则复刻 guardMathBlocks 的行内分支：
+//   · 开 $ 之后紧跟 \n / \r / $ / ` / < 的不算公式；
+//   · 扫描中遇到 HTML 标签起始（< 后跟 / 或字母）即放弃（不成对）；
+//   · 闭合 $ 前是空白且内容不像数学 → 拒绝（保护 "$ 100 $" 这类货币文本）；
+//   · inner 含换行，或含「两侧被空白包围的 |」（表格列分隔符）→ 拒绝；
+//   · 行内代码 `...` 内的 $ 不参与（与渲染侧 inBacktick 一致）。
+function stripInlineMath(raw) {
+  const s = String(raw);
+  let out = '';
+  let i = 0;
+  let inBacktick = false;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === '`') { inBacktick = !inBacktick; out += ch; i++; continue; }
+    if (ch !== '$' || inBacktick) { out += ch; i++; continue; }
+    const next = s[i + 1];
+    if (next === undefined || next === '\n' || next === '\r' || next === '$' || next === '`' || next === '<') {
+      out += ch; i++; continue;
+    }
+    let j = i + 1;
+    let closed = false;
+    while (j < s.length) {
+      const c = s[j];
+      if (c === '<' && (s[j + 1] === '/' || /[A-Za-z]/.test(s[j + 1] || ''))) break;   // 遇标签：不成对
+      if (c === '$') {
+        const inner = s.slice(i + 1, j);
+        const closePrevIsSpace = /\s$/.test(inner);
+        if (/[\n\r]/.test(inner)) break;
+        if (inner.includes('|') && /(?:^|\s)\|(?:\s|$)/.test(inner)) break;
+        if (closePrevIsSpace && !looksLikeMath(inner)) break;
+        out += ' ';            // 公式整段丢弃（渲染侧同样不参与 slug）
+        i = j + 1;
+        closed = true;
+        break;
+      }
+      j++;
+    }
+    if (closed) continue;
+    out += ch;                 // 未配对 / 被拒绝：按字面量保留，继续往后找
+    i++;
+  }
+  return out;
+}
+
+function stripInlineMarkdown(raw) {
+  // 数学要先处理：此时行内代码的反引号还在，$ 在代码里不会被误当公式
+  let s = stripInlineMath(raw);
+  s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');     // 图片 ![alt](url)
+  s = s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');  // 链接 [text](url) -> text
+  s = s.replace(/\[([^\]]*)\]\[[^\]]*\]/g, '$1'); // 引用式链接 [text][ref] -> text
+  s = s.replace(/<(https?:\/\/[^>]+)>/g, '$1');   // 自动链接 <http://x> -> http://x
+  s = s.replace(/`([^`]+)`/g, '$1');              // 行内代码 `code` -> code
+  // 真形态的行内 HTML 标签（渲染侧只保留其文本内容；`a < b` 这种不是标签，不受影响）
+  s = s.replace(/<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^>]*)?>/g, '');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '$1');        // 粗体 **x**
+  s = s.replace(/__([^_]+)__/g, '$1');            // 粗体 __x__
+  s = s.replace(/\*([^*]+)\*/g, '$1');            // 斜体 *x*
+  s = s.replace(/_([^_]+)_/g, '$1');              // 斜体 _x_
+  s = s.replace(/~~([^~]+)~~/g, '$1');            // 删除线 ~~x~~
+  s = s.replace(/[`*_~\[\]]/g, '');               // 残留标记字符
+  s = s.replace(/\s+#+\s*$/, '');                 // 尾随 #（GitHub 风格闭合标题）
+  s = s.replace(/\s+/g, ' ').trim();              // 合并空白
+  return s;
+}
+
+function extractHeadings(content, opts) {
+  const headingToId = opts && opts.headingToId;
+  const lines = (content || '').split('\n');
+  const headings = [];
+  const idCount = {};
+  let inCodeBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trimStart().startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+
+    const match = line.match(/^(#{1,6})\s+(.+)/);
+    if (match) {
+      const level = match[1].length;
+      // 完整清理文本用于显示（面包屑 / 大纲），剥离 Markdown 内联语法残留
+      const text = stripInlineMarkdown(match[2]);
+      // 锚点 id 必须与**渲染器**生成的 id 一致（unified-renderer.js 的 slugifyHeading 作用于
+      // 渲染后的文本）——旧实现用「源码里剥掉 [*`~[]] 的字符串」做 slug，于是
+      // `# [Link](url)` 得到 `linkurl`（大纲）而渲染成 `id="link"`，点击大纲静默失效
+      // （审计发现，2026-09-24）。这里改用与渲染一致的纯文本。
+      const baseId = headingToId ? headingToId(text) : text;
+      const n = idCount[baseId] || 0;
+      idCount[baseId] = n + 1;
+      const id = n === 0 ? baseId : baseId + '-' + (n + 1);
+      headings.push({ level, text, id, line: i });
+    }
+  }
+  return headings;
+}
+
+function buildOutlineTree(headings) {
+  const root = { level: 0, children: [] };
+  const stack = [root];
+  for (const h of headings) {
+    const node = { ...h, children: [], expanded: true };
+    while (stack.length > 1 && stack[stack.length - 1].level >= h.level) {
+      stack.pop();
+    }
+    stack[stack.length - 1].children.push(node);
+    stack.push(node);
+  }
+  return root.children;
+}
+
+function renderOutlineHtml(tree, opts) {
+  const escapeHtml = (opts && opts.escapeHtml) || ((s) => s);
+  // 大纲层级过滤：maxLevel=0 表示全部；>0 时仅渲染 level<=maxLevel 的节点，
+  // 被过滤子树的父节点仍保留（不渲染其更深子节点）。
+  const maxLevel = (opts && opts.maxLevel) || 0;
+  const renderTree = (nodes) => {
+    let html = '';
+    for (const node of nodes) {
+      if (maxLevel && node.level > maxLevel) continue;
+      const hasChildren = node.children.length > 0;
+      html += '<div class="outline-item-wrapper">';
+      html += `<div class="outline-item level-${node.level}" data-id="${node.id}" data-line="${node.line}">`;
+      // 始终输出 toggle 占位：无子节点项加 outline-toggle--hidden（隐藏且不可点击），
+      // 保留与有子节点项一致的宽度，使各级标签起始位置对齐，避免同级标题因
+      // 有无小三角而视觉错位（见 styles.css .outline-toggle--hidden）。
+      const toggleCls = hasChildren ? 'outline-toggle' : 'outline-toggle outline-toggle--hidden';
+// 大纲 toggle 用实心等腰小三角（fill currentColor）。viewBox 与 CSS 渲染都采用方阵（12×12），
+// 展开时三角位于下半部指向下，折叠态旋转 -90° 后图形尺寸容器不变，避免旋转导致视觉变大/比例变形。
+// 形状：底边较长、高较短的扁平等腰三角形（底 9 / 高 4），避免过于尖锐
+html += `<span class="${toggleCls}"><svg viewBox="0 0 12 12" fill="currentColor" aria-hidden="true"><path d="M1.5 4 L10.5 4 L6 8 Z"/></svg></span>`;
+      html += `<span class="outline-label">${escapeHtml(node.text)}</span>`;
+      html += '</div>';
+      if (hasChildren) {
+        // 过滤生效时不再渲染更深子树（已被上方 continue 跳过），否则正常渲染
+        html += `<div class="outline-children">${renderTree(node.children)}</div>`;
+      }
+      html += '</div>';
+    }
+    return html;
+  };
+  return renderTree(tree);
+}
+
+// 根据当前行号计算面包屑路径：返回从根到当前位置所经过的所有标题祖先。
+// 算法：按行号顺序遍历标题，维护一条单调不升的路径；遇到更浅或同级标题时回退。
+function computeBreadcrumbPath(headings, line) {
+  const path = [];
+  for (const h of headings) {
+    if (h.line > line) break;
+    while (path.length && path[path.length - 1].level >= h.level) {
+      path.pop();
+    }
+    path.push(h);
+  }
+  return path;
+}
+
+// 生成面包屑 DOM 字符串（纯函数，便于单元测试）。
+// 溢出处理策略（统一为一套，避免"折叠"与"滚动"互相打架）：
+//  1) 每个标题由 CSS `.crumb-label` 做单行省略号截断，防止单个超长标题占满整行；
+//  2) 层级再多也全部渲染，超出可视宽度时由外层容器横向滚动浏览
+//     （滚轮转横滚 + 自动定位当前项 + 左侧"回到开头"按钮），滚动一定能看全每一层，
+//     不存在被永久隐藏、滚动也还原不出的层级。
+function escapeBreadcrumbAttr(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function escapeBreadcrumbText(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function renderBreadcrumbHtml(path, fileName, opts) {
+  const o = opts || {};
+  const icon = o.iconSvg || '';
+  const sep = '<span class="editor-breadcrumb-separator">›</span>';
+
+  const fileText = escapeBreadcrumbText(fileName || '');
+  const fileTitle = escapeBreadcrumbAttr(fileName || '');
+  let html = `<span class="editor-breadcrumb-file" title="${fileTitle}">${icon}<span class="crumb-label">${fileText}</span></span>`;
+
+  const crumb = (h, isLast) => {
+    const cls = isLast ? 'editor-breadcrumb-item active' : 'editor-breadcrumb-item';
+    const title = escapeBreadcrumbAttr(h.text);
+    return `<span class="${cls}" data-breadcrumb-line="${h.line}" title="${title}"><span class="crumb-label">${escapeBreadcrumbText(h.text)}</span></span>`;
+  };
+
+  for (let i = 0; i < path.length; i++) {
+    html += sep + crumb(path[i], i === path.length - 1);
+  }
+  return html;
+}
+
+const Outline = { extractHeadings, buildOutlineTree, renderOutlineHtml, computeBreadcrumbPath, renderBreadcrumbHtml };
+
+// 浏览器：作为独立 <script> 加载，挂到全局 Outline
+if (typeof window !== 'undefined' && typeof module === 'undefined') {
+  window.Outline = Outline;
+}
+// Node（测试 / 构建）：CommonJS 导出
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = Outline;
+}

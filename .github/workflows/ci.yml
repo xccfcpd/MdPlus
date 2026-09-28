@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # 手动触发入口（GitHub UI 的 Run workflow）；需该 workflow 已存在于【默认分支】才显示。
+  workflow_dispatch:
+
+# 取消同一 ref 上的旧运行，节省资源
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend (check + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node 22 (LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      # 完整安装（不 --omit=dev）：devDeps 含 esbuild/jsdom，test 与 build:renderer 都需要
+      - name: Install dependencies (npm ci, full)
+        run: npm ci
+
+      # ADR-7：先本地可执行，CI 见 P1-8。
+      # coupling-report / check-globals / entry-scripts / tauri-api 仅读源码，无需打包产物。
+      - name: Coupling & global-export guards
+        run: npm run check
+
+      # npm test 的 pretest 钩子会自动执行 build:renderer 构建 unified-bundle，
+      # 之后 run-tests.cjs 跑全部 test/*.test.cjs（含需 eval bundle 的集成用例）。
+      #
+      # 失败时把「失败用例名 + 失败摘要」写成 ::error:: 注解。原因：Actions 的原始日志
+      # 需要登录才能查看，而注解可经 check-runs API 匿名读取 —— 这是无凭据环境下定位
+      # 失败用例的唯一通道（曾因此只能靠猜）。注意 set +e：不让管道提前中止本步骤。
+      - name: Run tests
+        run: |
+          set +e
+          npm test 2>&1 | tee /tmp/tm-test.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            names=$(grep -E '^[[:space:]]*not ok ' /tmp/tm-test.log | head -8 | tr '\n' ';' | cut -c1-900)
+            [ -z "$names" ] && names="(未匹配到 not ok)"
+            echo "::error title=失败用例::${names}"
+            detail=$(grep -n -A6 -E "not ok |name: '(Assertion|Type|Range)Error'" /tmp/tm-test.log | tail -26 | tr '\n' '|' | cut -c1-2600)
+            [ -z "$detail" ] && detail=$(tail -n 30 /tmp/tm-test.log | tr '\n' '|' | cut -c1-2500)
+            echo "::error title=失败摘要::${detail}"
+            exit 1
+          fi
+
+      # P2-3：release 前端聚合冒烟——验证 dist/ 可生成（beforeBuildCommand 关键一环，
+      # 若 build-frontend 在 CI 上坏掉，tauri build 会直接失败）
+      - name: Frontend bundle smoke (build-frontend)
+        run: npm run build-frontend
+
+  rust:
+    name: Rust (cargo test, optional)
+    runs-on: ubuntu-latest
+    # 可选关卡：Linux webkit 环境偶发不稳不应阻塞前端合并；失败仅作信号。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ github.repository }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ github.repository }}-
+
+      # Tauri v2 Linux 编译依赖
+      - name: Install system dependencies
+        run: |
+          # runner 镜像预置的 Google Chrome 第三方源时常出现 Hash Sum mismatch，
+          # 会让 apt-get update 以 exit 100 失败（cargo test 会被连带跳过）。与项目代码无关。
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list*
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Run cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+  # 浏览器回归（真实 Chrome / 真实布局）：test/browser/ 下的用例验证的是 jsdom 天然测不到的
+  # 滚动同步、大纲跳转定位、大文档横幅等「依赖真实排版引擎」的行为。
+  #
+  # 2026-09-26 起驱动改为零依赖 CDP（test/browser/_cdp.cjs，Node 内置 WebSocket + 手写协议）：
+  # 不再需要 puppeteer-core，唯一前置条件就是一个 Chrome 二进制（CHROME_PATH，或 PATH 中可发现）。
+  # 因此本关卡也从「仅信号、非阻塞」改为**阻塞式**：
+  #   - Chrome 缺失 → 直接失败（不再打 warning 后继续，那等于没有覆盖）；
+  #   - 检测到 SKIP → 直接失败（SKIP 意味着用例没跑，"绿灯"不得代表"已验证"）。
+  browser:
+    name: Browser regression (real Chrome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node 22 (LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (npm ci, full)
+        run: npm ci
+
+      - name: Locate Chrome
+        id: chrome
+        run: |
+          p=$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)
+          if [ -z "$p" ]; then
+            echo "::error title=Chrome 缺失::runner 上未找到 Chrome，浏览器回归无法执行（本关卡已改为阻塞式，故直接失败）"
+            exit 1
+          fi
+          echo "path=$p" >> "$GITHUB_OUTPUT"
+
+      - name: Build renderer bundle
+        run: npm run build:renderer
+
+      - name: Run browser tests
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: |
+          set +e
+          node scripts/run-tests.cjs browser 2>&1 | tee /tmp/tm-browser.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if grep -q 'SKIP:' /tmp/tm-browser.log; then
+            echo "::error title=浏览器回归被跳过::检测到 SKIP：用例未真实执行（缺 Chrome 或 _cdp.cjs 不可用），本次没有覆盖，按失败处理"
+            exit 1
+          fi
+          exit "$status"

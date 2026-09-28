@@ -1,0 +1,81 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+target/
+out/
+
+# Generated renderer bundle — built from src/unified-renderer.js via scripts/build-renderer.mjs
+# Regenerate with `npm run build:renderer` (also auto-run on `npm install` via the `prepare` script). Do NOT edit by hand.
+src/lib/unified-bundle.js
+
+# P2-3 vendor 锁定：以下 7 个库由 scripts/ensure-vendor.mjs 从 node_modules 确定性再生
+# （接入 package.json "prepare"，CI 用完整 npm ci 自动重建）。请勿手改、勿提交。
+src/lib/codemirror/
+src/lib/katex/
+src/lib/mermaid/
+src/lib/html2canvas.min.js
+src/lib/markdown-it.min.js
+src/lib/html-docx.min.js
+src/lib/highlight.js/
+# 图表引擎 vendor（2026-09）：echarts / graphviz / wavedrom 由 ensure-vendor 从
+# node_modules 拷贝或打包；markmap 由 buildMarkmap() 用 esbuild 打包为单文件。
+src/lib/echarts.min.js
+src/lib/graphviz.min.js
+src/lib/wavedrom/
+src/lib/markmap/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/WixTools/
+src-tauri/Frameworks/
+src-tauri/*.msi
+src-tauri/*.exe
+src-tauri/*.app
+
+# Lock files (keep package-lock.json for reproducibility)
+# pnpm-lock.yaml
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+test.md
+.workbuddy/
+.agents/
+skills-lock.json
+
+# 2026-09-27 移除：AI 技能框架与平台模板目录（不再入库，防误加回）
+.claude/
+.superpowers/
+.gitee/
+
+# Local tool data / build artifacts (not part of source)
+release/
+.git-rewrite/
+.opencode/
+ccstart.bat
+
+# Ad-hoc debug scripts (临时调试产物，勿入库)
+dbg-*.cjs
+# 审计/体检用的一次性脚本（形如 .tmp-xxx.cjs）：即使某轮被打断也不会误入库
+.tmp-*
+
+# Stray build artifacts from version testing (勿入库)
+dist.old-*/
+*.log
+*.txt

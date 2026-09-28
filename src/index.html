@@ -1,0 +1,1494 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-color-scheme="default">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>TizuMark</title>
+  <link rel="icon" type="image/png" href="app-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="lib/codemirror/codemirror.css">
+  <link rel="stylesheet" href="lib/codemirror/theme/material-darker.css">
+  <link rel="stylesheet" href="lib/codemirror/addon/dialog/dialog.css">
+  <link rel="stylesheet" href="lib/highlight.js/github.min.css" id="highlight-theme">
+    <link rel="stylesheet" href="lib/katex/katex.min.css">
+  <!-- P0-1 全局错误兜底：在首个业务脚本之前注册。
+       捕获阶段监听 window 'error'，同时兜住：
+         (a) 运行时抛错（含 app.js:1 顶层解构 TypeError 这类白屏单点）；
+         (b) 资源加载失败（<script>/<link> 缺失，捕获阶段才能收到）。
+       比「全局 handler + 逐脚本 onerror」更健壮且无冗余。 -->
+  <script>
+    (function () {
+      var bar = null;
+      function showErrorBar(msg, level) {
+        try {
+          if (!bar) {
+            bar = document.createElement('div');
+            bar.id = 'fatal-error-bar';
+            bar.setAttribute('role', 'alert');
+            // 固定底部条，不遮挡 Tauri 标题栏/窗口控制按钮/工具栏菜单/格式工具栏
+            // （顶部位置会压住 max/min/close 与菜单栏，改为 fixed bottom 后只占底部一条）
+            (document.body || document.documentElement).appendChild(bar);
+          }
+          var bg = level === 'warn' ? '#d97706' : '#b00020';
+          var prefix = level === 'warn' ? '⚠️ 警告：' : '❌ 错误：';
+          bar.style.cssText = 'display:block;position:fixed;left:0;right:0;bottom:0;' +
+            'z-index:100000;background:' + bg + ';color:#fff;' +
+            'font:12px/1.5 system-ui,-apple-system,sans-serif;' +
+            'padding:8px 36px 8px 14px;white-space:pre-wrap;word-break:break-all;' +
+            'box-shadow:0 -2px 6px rgba(0,0,0,.25);';
+          bar.innerHTML = '<span>' + prefix + escapeHtml(msg) + '</span>' +
+            '<button onclick="this.parentElement.style.display=\'none\'"' +
+            ' style="position:absolute;right:8px;top:50%;transform:translateY(-50%);' +
+            'background:none;border:none;color:#fff;cursor:pointer;font-size:16px;padding:0 4px;">×</button>';
+          bar.style.display = 'block';
+        } catch (e) { /* 兜底自身失败不再抛 */ }
+      }
+      // 测试用内部导出（无运行时副作用，仅供 jsdom 单测直接调用验证位置策略）
+      window.__errorBar = showErrorBar;
+      function escapeHtml(s) {
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      }
+      // 外部模型/服务返回的、与应用逻辑无关、用户无法操作的噪声错误（例如把图片透传给
+      // 不支持视觉输入的模型时第三方返回的报错），不应以红色错误条打扰用户，直接忽略。
+      function isExternalModelNoise(m) {
+        return /this model does not support image input/i.test(String(m));
+      }
+      // 浏览器自身的良性提示（不是应用 bug）：ResizeObserver 在一次回调里改了布局，
+      // 同一帧内又产生通知时，Chrome/Edge 会以 window error 形式抛出
+      // 「ResizeObserver loop completed with undelivered notifications」（或 limit exceeded）。
+      // 主流框架（React 等）都按噪声忽略；这里同样过滤，否则用户会看到红色错误条误以为程序坏了。
+      function isBenignBrowserNotice(m) {
+        return /ResizeObserver loop (completed with undelivered notifications|limit exceeded)/i.test(String(m));
+      }
+      window.addEventListener('error', function (ev) {
+        // 资源加载失败
+        if (ev && ev.target && ev.target !== ev.currentTarget && ev.target.tagName) {
+          var tag = ev.target.tagName.toLowerCase();
+          // img/audio/video 等预览资源加载失败由 processImages 负责（base64 替换 / 标红），
+          // 浏览器初次尝试 http 加载的 404 是瞬时噪声，全局兜底不应介入，直接忽略。
+          if (tag === 'img' || tag === 'audio' || tag === 'video' || tag === 'source') {
+            return;
+          }
+          // script / link / stylesheet 加载失败是致命的
+          var src2 = (ev.target.getAttribute && (ev.target.src || ev.target.href)) || '(未知资源)';
+          console.error('[P0-1] 致命资源加载失败 <' + tag + '>：' + src2);
+          showErrorBar('资源加载失败 <' + tag + '>：' + src2, 'error');
+          return;
+        }
+        // JS 运行时错误
+        var msg = '';
+        if (ev && ev.message) {
+          msg = String(ev.message);
+        } else if (ev && ev.error && ev.error.message) {
+          msg = String(ev.error.message);
+        } else if (ev && ev.error) {
+          msg = String(ev.error);
+        } else {
+          console.warn('[P0-1] 收到无信息的 error Event（可能为 WebView 初始化噪声）', ev);
+          return;
+        }
+        if (ev && ev.filename) msg += '  (' + ev.filename + ':' + (ev.lineno || '?') + ':' + (ev.colno || '?') + ')';
+        if (isBenignBrowserNotice(msg)) { console.warn('[P0-1] 已忽略浏览器良性提示：' + msg); return; }
+        console.error('[P0-1] 运行时错误：' + msg, ev.error || '');
+        if (isExternalModelNoise(msg)) { console.warn('[P0-1] 已忽略外部模型噪声错误：' + msg); return; }
+        showErrorBar(msg, 'error');
+      }, true);
+      window.addEventListener('unhandledrejection', function (ev) {
+        var r = ev && ev.reason;
+        var msg = (r && r.stack) ? r.stack : (r ? String(r) : '(空 reason)');
+        if (isBenignBrowserNotice(msg)) { console.warn('[P0-1] 已忽略浏览器良性提示：' + msg); return; }
+        console.error('[P0-1] 未处理的 Promise 拒绝：' + msg, r);
+        if (isExternalModelNoise(msg)) { console.warn('[P0-1] 已忽略外部模型噪声错误：' + msg); return; }
+        showErrorBar('未处理的 Promise 拒绝：' + msg, 'error');
+      });
+    })();
+  </script>
+</head>
+<body>
+  <div id="app">
+    <div id="drag-overlay" class="hidden"></div>
+    <div id="toast-container"></div>
+    <header class="header" data-tauri-drag-region>
+      <div class="toolbar" data-tauri-drag-region>
+        <div class="toolbar-left">
+          <img id="app-icon" class="app-icon" src="app-icon.png" alt="TizuMark" draggable="false">
+          <div class="dropdown">
+            <button id="btn-file" class="toolbar-btn" title="文件">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/></svg>
+              <span>文件</span>
+              <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div class="dropdown-menu hidden" id="file-menu">
+              <div class="dropdown-item" id="btn-new">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 15h6"/><path d="M12 18v-6"/></svg>
+                <span>新建</span>
+                <span class="shortcut">Ctrl+N</span>
+              </div>
+              <div class="dropdown-item" id="btn-open">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"/></svg>
+                <span>打开</span>
+                <span class="shortcut">Ctrl+O</span>
+              </div>
+              <div class="dropdown-item" id="btn-open-folder">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/><path d="M2 8h20"/><path d="M6 12h4"/><path d="M6 16h4"/></svg>
+                <span>打开文件夹</span>
+              </div>
+              <div class="dropdown-item dropdown-submenu-trigger" id="btn-recent" data-submenu="recent-files-submenu">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span>打开最近的文件</span>
+                <svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </div>
+              <div class="dropdown-menu submenu hidden" id="recent-files-submenu"><!-- 动态渲染 --></div>
+              <div class="dropdown-item dropdown-submenu-trigger" id="btn-recent-workspaces" data-submenu="recent-workspaces-submenu">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"/><path d="M2 8h20"/><path d="M6 12h4"/><path d="M6 16h4"/></svg>
+                <span id="label-recent-workspaces">打开最近的工作区</span>
+                <svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+              </div>
+              <div class="dropdown-menu submenu hidden" id="recent-workspaces-submenu"><!-- 动态渲染 --></div>
+              <div class="dropdown-item" id="btn-save">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>
+                <span>保存</span>
+                <span class="shortcut">Ctrl+S</span>
+              </div>
+              <div class="dropdown-item" id="btn-save-as">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                <span>另存为</span>
+                <span class="shortcut"></span>
+              </div>
+              <div class="dropdown-separator"></div>
+              <div class="dropdown-item" id="btn-reload-menu">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <polyline points="23 4 23 10 17 10"/>
+                  <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                </svg>
+                <span>重新加载</span>
+                <span class="shortcut">Ctrl+R</span>
+              </div>
+              <div class="dropdown-separator"></div>
+              <div class="dropdown-item" id="btn-export-html">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                <span>导出 HTML</span>
+              </div>
+              <!-- 导出长图：功能保留（src/modules/export.js exportImage），仅从菜单隐藏，避免大文档误触发 OOM 风险 -->
+              <div class="dropdown-item" id="btn-export-img" style="display:none">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+                <span>导出长图</span>
+              </div>
+              <div class="dropdown-item" id="btn-export-pdf">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 9V3a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v6"/><rect x="6" y="14" width="12" height="8" rx="1"/></svg>
+                <span>导出 PDF</span>
+                <span class="shortcut"></span>
+              </div>
+              <div class="dropdown-item" id="btn-export-word">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M8.5 13h7M8.5 16h7M8.5 10h3"/></svg>
+                <span>导出DOCX</span>
+              </div>
+              <div class="dropdown-item" id="btn-shortcuts">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001"/><path d="M10 8h.001"/><path d="M14 8h.001"/><path d="M18 8h.001"/><path d="M8 12h.001"/><path d="M12 12h.001"/><path d="M16 12h.001"/><path d="M7 16h10"/></svg>
+                <span>快捷键设置</span>
+              </div>
+              <div class="dropdown-separator"></div>
+              <div class="dropdown-item" id="btn-settings">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+                <span>设置</span>
+              </div>
+            </div>
+          </div>
+          <div class="dropdown">
+            <button id="btn-view" class="toolbar-btn" title="视图">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              <span>视图</span>
+              <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div class="dropdown-menu hidden" id="view-menu">
+              <div class="dropdown-item" id="btn-sidebar-toggle">
+                <span class="dropdown-check" id="sidebar-check"></span>
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+                <span>侧边栏</span>
+              </div>
+            </div>
+          </div>
+          <div class="dropdown">
+            <button id="btn-help" class="toolbar-btn" title="帮助">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+              <span>帮助</span>
+              <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+            <div class="dropdown-menu hidden" id="help-menu">
+              <div class="dropdown-item" id="btn-user-guide">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
+                <span>使用说明</span>
+              </div>
+              <!-- 更新检查已停用（见 app.js checkUpdate 说明）：保留节点以免监听器取空，用 .hidden 类隐藏。
+                   注意：不可用 HTML hidden 属性——应用无全局 .hidden 规则，且 .dropdown-item 的
+                   display:flex 会覆盖 UA 样式表的 [hidden]{display:none} 导致静默失效（见 styles.css）。 -->
+              <div class="dropdown-item hidden" id="btn-check-update">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+                <span>检查更新</span>
+              </div>
+              <div class="dropdown-separator"></div>
+              <div class="dropdown-item" id="btn-devtools">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                <span>开发者工具</span>
+              </div>
+              <div class="dropdown-item" id="btn-about">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><path d="M12 17h.01"/></svg>
+                <span>关于</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="toolbar-center" data-tauri-drag-region>
+          <div class="view-mode-tabs">
+            <button id="btn-view-preview" class="view-mode-tab active" title="预览模式">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
+              <span>预览</span>
+            </button>
+            <button id="btn-view-edit" class="view-mode-tab" title="编辑模式">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+              <span>编辑</span>
+            </button>
+          </div>
+        </div>
+        <div class="toolbar-right">
+          <button id="btn-reload" class="toolbar-btn" title="重新加载文件">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+            </svg>
+          </button>
+          <button id="btn-theme" class="toolbar-btn" title="切换主题">
+            <svg class="icon" id="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="4"/>
+              <path d="M12 2v2"/><path d="M12 20v2"/>
+              <path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/>
+              <path d="M2 12h2"/><path d="M20 12h2"/>
+              <path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>
+            </svg>
+            <span id="theme-text">明亮</span>
+          </button>
+          <div class="window-controls">
+            <button id="btn-minimize" class="window-btn" title="最小化">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/></svg>
+            </button>
+            <button id="btn-maximize" class="window-btn" title="最大化">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/></svg>
+            </button>
+            <button id="btn-close" class="window-btn window-btn-close" title="关闭">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <!-- 格式工具栏：直接按钮 + 复合下拉（悬停展开），可折叠 -->
+      <div class="format-toolbar" id="format-toolbar">
+        <div class="fmt-content">
+          <!-- 直接按钮（常用） -->
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-bold" title="加粗 (Ctrl+B)"><b>B</b></button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-italic" title="斜体 (Ctrl+I)"><i>I</i></button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-strikethrough" title="删除线"><s>S</s></button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-link" title="链接 (Ctrl+K)">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+          </button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-image" title="图片">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>
+          </button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-hr" title="水平线">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/></svg>
+          </button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-highlight" title="高亮"><span class="fmt-hl">H</span></button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-superscript" title="上标"><span class="fmt-script">x<sup>2</sup></span></button>
+          <button class="fmt-btn fmt-icon-btn" data-action="insert-subscript" title="下标"><span class="fmt-script">x<sub>2</sub></span></button>
+          <span class="fmt-sep"></span>
+          <!-- 复合按钮（次常用，悬停展开） -->
+          <div class="fmt-dropdown">
+            <button class="fmt-btn fmt-dropdown-trigger" title="结构插入" data-i18n="structure"><span class="lbl">结构插入</span> <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+            <div class="dropdown-menu fmt-menu">
+              <div class="dropdown-item" data-action="insert-inline-code"><span>行内代码</span></div>
+              <div class="dropdown-item" data-action="insert-code-block"><span>代码块</span></div>
+              <div class="dropdown-item" data-action="insert-table"><span>表格</span></div>
+              <div class="dropdown-item" data-action="insert-quote"><span>引用块</span></div>
+              <div class="dropdown-item" data-action="insert-math-block"><span>数学公式</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-mermaid"><span>Mermaid 图表</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-plantuml"><span>PlantUML 图</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-d2"><span>D2 图</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-tikz"><span>TikZ 绘图</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-plot"><span>函数绘图</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-markmap"><span>思维导图</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-math-numbered"><span>编号公式</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-siunitx"><span>物理量 (siunitx)</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-toc"><span>目录 [TOC]</span><span class="shortcut"></span></div>
+            </div>
+          </div>
+          <div class="fmt-dropdown">
+            <button class="fmt-btn fmt-dropdown-trigger" title="列表" data-i18n="list"><span class="lbl">列表</span> <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+            <div class="dropdown-menu fmt-menu">
+              <div class="dropdown-item" data-action="insert-ul"><span>无序列表</span></div>
+              <div class="dropdown-item" data-action="insert-ol"><span>有序列表</span></div>
+              <div class="dropdown-item" data-action="insert-task"><span>任务列表</span></div>
+            </div>
+          </div>
+          <div class="fmt-dropdown">
+            <button class="fmt-btn fmt-dropdown-trigger" title="标题" data-i18n="heading"><span class="lbl">标题</span> <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+            <div class="dropdown-menu fmt-menu">
+              <div class="dropdown-item" data-action="insert-h1"><span># 标题 1</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-h2"><span>## 标题 2</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-h3"><span>### 标题 3</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-h4"><span>#### 标题 4</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-h5"><span>##### 标题 5</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-h6"><span>###### 标题 6</span><span class="shortcut"></span></div>
+            </div>
+          </div>
+          <div class="fmt-dropdown">
+            <button class="fmt-btn fmt-dropdown-trigger" title="提示块" data-i18n="callout"><span class="lbl">提示块</span> <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+            <div class="dropdown-menu fmt-menu">
+              <div class="dropdown-item" data-action="insert-callout-note"><span>Note 提示</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-callout-tip"><span>Tip 建议</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-callout-warning"><span>Warning 警告</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-callout-caution"><span>Caution 注意</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-callout-important"><span>Important 重要</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-admonition"><span>Admonition 提示</span><span class="shortcut"></span></div>
+              <div class="dropdown-item" data-action="insert-admonition-collapsible"><span>Admonition 折叠</span><span class="shortcut"></span></div>
+            </div>
+          </div>
+        </div>
+        <button class="fmt-btn fmt-collapse-toggle" id="fmt-collapse" title="折叠/展开工具栏">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+          <span class="fmt-toggle-label"></span>
+          <svg class="icon fmt-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="external-change-banner" class="external-change-banner" role="alert" aria-live="assertive">
+      <div class="ecb-info">
+        <span class="ecb-icon">⚠</span>
+        <span class="ecb-name"></span>
+        <span class="ecb-msg"></span>
+      </div>
+      <div class="ecb-actions">
+        <button class="ecb-btn ecb-reload" type="button"></button>
+        <button class="ecb-btn ecb-ignore" type="button"></button>
+        <button class="ecb-btn ecb-reload-all" type="button"></button>
+        <button class="ecb-btn ecb-ignore-all" type="button"></button>
+      </div>
+    </div>
+
+    <!-- 后端健康横幅：dev 模式下 Rust/浏览器模式后端不可用时显示（tauri-api 延迟求值防白屏的副作用——
+         页面常驻显示但没有任何后端，用户无法区分。此处为启动 + 30s 心跳探测失败时的可见化提示。
+         样式复用兜底报错条 .fatal-error-bar（fixed 底部红条） -->
+    <div id="backend-banner" class="fatal-error-bar hidden" role="alert" aria-live="assertive">
+      <span id="backend-banner-text"></span>
+    </div>
+
+    <div id="find-panel" class="find-panel hidden">
+      <div class="find-row">
+        <input type="text" id="find-input" placeholder="查找..." class="find-input">
+        <label class="find-option"><input type="checkbox" id="find-case"> 区分大小写</label>
+        <label class="find-option"><input type="checkbox" id="find-regex"> 正则</label>
+        <label class="find-option"><input type="checkbox" id="find-loop"> 循环查找</label>
+        <button id="find-prev" class="find-btn">上一个</button>
+        <button id="find-next" class="find-btn">下一个</button>
+        <span id="find-count" class="find-count"></span>
+        <div class="find-separator"></div>
+        <input type="text" id="replace-input" placeholder="替换..." class="find-input">
+        <button id="replace-one" class="find-btn">替换</button>
+        <button id="replace-all" class="find-btn">全部替换</button>
+        <button id="find-close" class="find-btn find-close-btn">&times;</button>
+      </div>
+    </div>
+
+    <div id="preview-find-panel" class="find-panel hidden">
+      <div class="find-row">
+        <input type="text" id="preview-find-input" placeholder="在预览中查找..." class="find-input">
+        <label class="find-option"><input type="checkbox" id="preview-find-case"> 区分大小写</label>
+        <label class="find-option"><input type="checkbox" id="preview-find-regex"> 正则</label>
+        <label class="find-option"><input type="checkbox" id="preview-find-loop"> 循环查找</label>
+        <button id="preview-find-prev" class="find-btn">上一个</button>
+        <button id="preview-find-next" class="find-btn">下一个</button>
+        <span id="preview-find-count" class="find-count"></span>
+        <button id="preview-find-close" class="find-btn find-close-btn">&times;</button>
+      </div>
+    </div>
+
+    <main class="editor-container">
+      <div id="outline-sidebar" class="outline-sidebar">
+        <!-- 上：文件面板 -->
+        <div id="folder-content" class="folder-content sidebar-panel">
+          <div class="files-panel-header panel-header">
+            <span class="panel-title-group">
+              <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" /></svg>
+              <span class="panel-title" data-i18n="files">文件</span>
+            </span>
+            <span class="header-actions">
+              <button id="btn-all-folders" class="panel-action-btn" type="button" title="展开/折叠全部目录" aria-label="展开或折叠全部目录">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-6"/><path d="M12 8V2"/><path d="M4 12H2"/><path d="M10 12H8"/><path d="M16 12h-2"/><path d="M22 12h-2"/><path d="m15 19-3 3-3-3"/><path d="m15 5-3-3-3 3"/></svg>
+              </button>
+      <button id="files-chevron" class="panel-chevron" type="button" title="收起文件面板" aria-label="收起或展开文件面板">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+            </span>
+          </div>
+          <div class="folder-header" id="folder-header">
+            <span class="folder-path" id="folder-path"></span>
+            <div class="folder-sort" id="folder-sort">
+              <div id="folder-sort-key" class="folder-sort-key" title=""></div>
+              <button id="folder-sort-order" class="folder-sort-order" type="button" title="升序" aria-label="切换排序方向"></button>
+            </div>
+            <button id="folder-close" class="folder-close-btn" title="关闭文件夹">&times;</button>
+          </div>
+          <div id="folder-tree" class="folder-tree"></div>
+        </div>
+        <!-- 水平拖拽条：调整文件/大纲面板高度比例 -->
+        <div id="sidebar-h-resizer" class="sidebar-h-resizer" title="拖拽调整上下比例"></div>
+        <!-- 下：大纲面板 -->
+        <div class="outline-panel-header panel-header">
+          <span class="panel-title-group">
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h.01" /><path d="M3 12h.01" /><path d="M3 19h.01" /><path d="M8 5h13" /><path d="M8 12h13" /><path d="M8 19h13" /></svg>
+            <span class="panel-title" data-i18n="outline">大纲</span>
+          </span>
+          <span class="header-actions">
+            <div id="outline-filter" class="outline-filter"></div>
+            <span class="header-divider" aria-hidden="true"></span>
+            <button id="btn-all-outline" class="panel-action-btn" type="button" title="展开/折叠全部大纲" aria-label="展开或折叠全部大纲">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22v-6"/><path d="M12 8V2"/><path d="M4 12H2"/><path d="M10 12H8"/><path d="M16 12h-2"/><path d="M22 12h-2"/><path d="m15 19-3 3-3-3"/><path d="m15 5-3-3-3 3"/></svg>
+            </button>
+      <button id="outline-chevron" class="panel-chevron" type="button" title="收起大纲面板" aria-label="收起或展开大纲面板">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+          </span>
+        </div>
+        <div id="outline-content" class="outline-content sidebar-panel"></div>
+      </div>
+      <div class="outline-resizer" id="outline-resizer"></div>
+       <div class="editor-column">
+      <div id="large-file-banner" class="large-file-banner hidden" role="alert" aria-live="polite">
+       <span id="large-file-banner-text"></span>
+       <div class="large-file-banner-actions">
+         <button id="large-file-banner-dont-remind" class="large-file-banner-dont-remind" type="button">不再提醒</button>
+         <button id="large-file-banner-close" class="large-file-banner-dont-remind" type="button">关闭</button>
+       </div>
+     </div>
+         <div class="tab-bar-wrapper">
+          <button id="tab-scroll-left" class="tab-scroll-arrow hidden" title="向左滚动">&#9664;</button>
+          <div class="tab-bar-scroll" id="tab-bar-scroll">
+            <div id="tab-bar" class="tab-bar" role="tablist" aria-label="标签页">
+              <div class="tab active" data-index="0">
+                <span class="tab-name">未命名1</span>
+                <span class="tab-close">&times;</span>
+              </div>
+              <button id="btn-add-tab" class="tab-add" title="新建标签页">+</button>
+            </div>
+          </div>
+          <button id="tab-scroll-right" class="tab-scroll-arrow hidden" title="向右滚动">&#9654;</button>
+        </div>
+        <div class="editor-row">
+          <div class="editor-pane" id="editor-pane">
+            <div id="editor-breadcrumb" class="editor-breadcrumb hidden" aria-label="面包屑导航">
+              <button id="editor-breadcrumb-overflow" class="editor-breadcrumb-overflow" type="button" title="回到开头" aria-label="回到开头">&#8249;</button>
+              <div class="editor-breadcrumb-scroll" id="editor-breadcrumb-scroll">
+                <div class="editor-breadcrumb-content" id="editor-breadcrumb-content"></div>
+              </div>
+            </div>
+            <div id="editor-wrapper"></div>
+          </div>
+          <div class="resizer" id="resizer"></div>
+          <div class="preview-pane" id="preview-pane">
+            <div id="preview-wrapper">
+              <div id="preview" class="preview-content"></div>
+              <button id="scroll-top-btn" class="scroll-top-btn hidden" title="回到顶部">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m18 15-6-6-6 6"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="pane-loading" class="pane-loading hidden"><div class="pane-spinner"></div></div>
+      </div>
+      <div class="side-btn" id="btn-side-left" title="折叠编辑器">&#9664;</div>
+      <div class="side-btn" id="btn-side-right" title="折叠预览">&#9654;</div>
+    </main>
+
+    <footer class="statusbar">
+      <span id="status-text">就绪</span>
+      <div class="statusbar-right">
+        <span id="word-count">原始字数: 0</span>
+        <span id="preview-word-count">预览字数: 0</span>
+        <span id="line-count">行数: 0</span>
+        <span id="cursor-position">行 1, 列 1</span>
+      </div>
+    </footer>
+  </div>
+
+  <script src="lib/codemirror/codemirror.js"></script>
+  <script src="lib/codemirror/mode/markdown/markdown.js"></script>
+  <script src="lib/codemirror/mode/gfm/gfm.js"></script>
+  <script src="lib/codemirror/mode/javascript/javascript.js"></script>
+  <script src="lib/codemirror/mode/python/python.js"></script>
+  <script src="lib/codemirror/addon/mode/simple.js"></script>
+  <script src="lib/codemirror/mode/rust/rust.js"></script>
+  <script src="lib/codemirror/mode/htmlmixed/htmlmixed.js"></script>
+  <script src="lib/codemirror/mode/xml/xml.js"></script>
+  <script src="lib/codemirror/mode/css/css.js"></script>
+  <script src="lib/codemirror/mode/yaml/yaml.js"></script>
+  <script src="lib/codemirror/mode/shell/shell.js"></script>
+  <script src="lib/codemirror/addon/mode/overlay.js"></script>
+  <script src="lib/codemirror/addon/edit/continuelist.js"></script>
+  <script src="lib/codemirror/addon/edit/closebrackets.js"></script>
+  <script src="lib/codemirror/addon/edit/matchbrackets.js"></script>
+  <script src="lib/codemirror/addon/search/search.js"></script>
+  <script src="lib/codemirror/addon/search/searchcursor.js"></script>
+  <script src="lib/codemirror/addon/search/jump-to-line.js"></script>
+  <script src="lib/codemirror/addon/dialog/dialog.js"></script>
+  <script src="lib/codemirror/addon/selection/active-line.js"></script>
+  <script src="lib/highlight.js/highlight.min.js"></script>
+  <script src="lib/katex/katex.min.js"></script>
+  <!-- mhchem 化学扩展（\ce{...} / \pu{...}）：必须位于 katex.min.js 之后、
+       auto-render.min.js 之前，否则 auto-render 渲染时拿不到 \ce 宏。 -->
+  <script src="lib/katex/mhchem.min.js"></script>
+  <script src="lib/katex/auto-render.min.js"></script>
+  <script src="lib/mermaid/mermaid.min.js"></script>
+  <!-- 图表引擎（Mermaid 之外）：ECharts / Graphviz / WaveDrom 三个库**不在启动期加载**。
+       它们只在文档里真的出现对应代码块（```echarts / ```dot / ```wavedrom）时才用得到，
+       故改为首次遇到时按需加载（diagram-renderers.js: ensureEngine）。graphviz.min.js 把
+       WASM 以 base64 内联在文件内，启动就解析它最不划算。
+       wavedrom 的皮肤脚本（给 window.WaveSkin 赋值，缺失会抛 "no skins found"）由同一处按
+       「主库 → 皮肤」顺序一起加载，故这里不再常驻。
+       ⚠ mermaid 仍保持常驻：它的**同步占位阶段**（preview-post: prepareMermaidPlaceholders）
+       以「mermaid 全局是否存在」决定是否建占位容器，改懒加载须先重构该阶段（否则首次打开含
+       图文档时会整篇不渲染），收益/风险比不划算（2026-09-26）。 -->
+  <!-- html2canvas（PNG 导出 / 图表转 PNG）与 html-docx（Word 的 altChunk 回退路径）都只在
+       导出时才用得到，已改为导出时按需加载（export.js: _ensureHtml2CanvasLoaded /
+       _ensureHtmlDocxLoaded），不再占用冷启动解析时间（2026-09-26）。 -->
+  <script src="lib/markdown-it.min.js"></script>
+  <!-- 关于对话框 -->
+  <div id="about-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <div class="dialog">
+      <div class="dialog-header dialog-drag-handle">
+        <h2 id="about-title">关于 TizuMark</h2>
+        <button class="dialog-close" id="about-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content about-content">
+        <!-- 版本信息（默认展开） -->
+        <div class="dependency-details" data-collapsed="false">
+          <div class="dependency-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10" /><path d="M12 16v-4" /><path d="M12 8h.01" /></svg>
+            <span class="dependency-name">版本信息</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="dependency-body about-version-body">
+            <div class="about-app-line">
+              <span class="about-app-name">TizuMark</span>
+              <span id="about-version" class="about-version-chip">TizuMark v1.2.3</span>
+            </div>
+            <p id="about-version-desc" class="about-version-desc">轻量级跨平台 Markdown 编辑器</p>
+            <p id="about-build" class="about-build">基于 Tauri v2.5 + Rust 构建</p>
+          </div>
+        </div>
+
+        <!-- 许可协议（默认展开） -->
+        <div class="dependency-details" data-collapsed="false">
+          <div class="dependency-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+            <span class="dependency-name">许可协议</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="dependency-body">
+            <p>Copyright (c) 2024-2026 TizuMark</p>
+            <p>本软件版权归 TizuMark 所有，保留所有权利。</p>
+            <p>未经版权所有者许可，不得复制、修改或再分发本软件。</p>
+          </div>
+        </div>
+
+        <!-- 第三方组件（默认展开） -->
+        <div class="dependency-details" data-collapsed="false">
+          <div class="dependency-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z" /><path d="M12 22V12" /><polyline points="3.29 7 12 12 20.71 7" /><path d="m7.5 4.27 9 5.15" /></svg>
+            <span class="dependency-name">第三方组件</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="dependency-body">
+            <div class="dependency-list">
+              <div class="dependency-item">
+                <strong>CodeMirror</strong>
+                <span class="license-badge">MIT</span>
+                <p>代码编辑器组件</p>
+              </div>
+              <div class="dependency-item">
+                <strong>highlight.js</strong>
+                <span class="license-badge">BSD-3-Clause</span>
+                <p>语法高亮库</p>
+              </div>
+              <div class="dependency-item">
+                <strong>markdown-it</strong>
+                <span class="license-badge">MIT</span>
+                <p>Markdown 解析与自动链接识别（预览管线）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>unified / remark / rehype</strong>
+                <span class="license-badge">MIT</span>
+                <p>Markdown 处理管线（解析 · GFM · HTML 转换 · 安全过滤）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>KaTeX</strong>
+                <span class="license-badge">MIT</span>
+                <p>数学公式渲染</p>
+              </div>
+              <div class="dependency-item">
+                <strong>KaTeX mhchem 扩展</strong>
+                <span class="license-badge">MIT / Apache-2.0</span>
+                <p>化学式与化学方程式渲染（\ce / \pu，源自 mhchem / MathJax）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>Mermaid</strong>
+                <span class="license-badge">MIT</span>
+                <p>图表绘制库（流程图 / 时序图 / 甘特图 / 脑图等）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>ECharts</strong>
+                <span class="license-badge">Apache-2.0</span>
+                <p>数据图表渲染（```echarts 代码块）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>Graphviz (@hpcc-js/wasm)</strong>
+                <span class="license-badge">Apache-2.0 / EPL-1.0</span>
+                <p>DOT 图自动布局渲染（```dot 代码块）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>WaveDrom</strong>
+                <span class="license-badge">MIT</span>
+                <p>数字波形图渲染（```wavedrom 代码块）</p>
+              </div>
+              <div class="dependency-item">
+                <strong>html2canvas</strong>
+                <span class="license-badge">MIT</span>
+                <p>截图导出</p>
+              </div>
+              <div class="dependency-item">
+                <strong>Tauri</strong>
+                <span class="license-badge">MIT/Apache 2.0</span>
+                <p>桌面应用框架</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 版权与许可声明对话框 -->
+  <div id="eula-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="eula-title">
+    <div class="dialog eula-dialog">
+      <div class="dialog-header">
+        <h2 id="eula-title">版权与许可声明 / Copyright &amp; License</h2>
+      </div>
+      <div class="dialog-content">
+        <div class="eula-scroll">
+          <h3>TizuMark 版权与许可声明</h3>
+          <p>Copyright (c) 2024-2026 TizuMark</p>
+          <br>
+          <p>本软件版权归 TizuMark 所有，保留所有权利。</p>
+          <br>
+          <h4>你可以：</h4>
+          <p>在授权范围内安装、使用本软件。</p>
+          <br>
+          <h4>你不应：</h4>
+          <p>未经版权所有者许可，复制、修改、再分发本软件，或将其用于商业用途。</p>
+          <br>
+          <h4>本软件不提供任何担保。</h4>
+          <p>本软件按"现状"提供，不作任何明示或暗示的保证。在适用法律允许的最大范围内，作者不对因使用本软件而产生的任何直接或间接损害承担责任。</p>
+          <br>
+          <h4>第三方组件</h4>
+          <p>本软件包含根据各自开源许可证（MIT、BSD-3-Clause、Apache-2.0 等）分发的第三方组件。这些组件的版权和许可条款可在「帮助 → 关于」页面中查看。</p>
+          <hr style="margin:24px 0;border:none;border-top:1px solid var(--border-color)">
+          <h3>TizuMark Copyright &amp; License Statement</h3>
+          <p>Copyright (c) 2024-2026 TizuMark</p>
+          <br>
+          <p>Copyright of this software belongs to TizuMark. All rights reserved.</p>
+          <br>
+          <h4>You may:</h4>
+          <p>Install and use this software within the scope of the granted authorization.</p>
+          <br>
+          <h4>You may not:</h4>
+          <p>Copy, modify, redistribute, or use this software commercially without permission from the copyright holder.</p>
+          <br>
+          <h4>No Warranty.</h4>
+          <p>This software is provided "as is" without any express or implied warranty. To the maximum extent permitted by applicable law, the author shall not be liable for any direct or indirect damages arising from the use of this software.</p>
+          <br>
+          <h4>Third-Party Components</h4>
+          <p>This software contains third-party components distributed under their respective open-source licenses (MIT, BSD-3-Clause, Apache-2.0, etc.). Their copyright and license terms can be viewed in Help → About.</p>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="eula-accept" class="dialog-btn dialog-btn-primary">我知道了 / I Understand</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 更新对话框 -->
+  <div id="update-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="update-title">
+    <div class="dialog update-dialog">
+      <div class="dialog-header">
+        <h2 id="update-title">发现新版本</h2>
+        <button class="dialog-close" id="update-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <div id="update-state-checking">
+          <p id="update-state-checking-text">正在检查更新...</p>
+        </div>
+        <div id="update-state-available" class="hidden">
+          <p>TizuMark <span id="update-new-version" class="update-version-highlight"></span> <span id="update-available-suffix">可用</span></p>
+          <p class="update-current"><span id="update-current-version-label">当前版本: </span><span id="update-current-version"></span></p>
+          <div class="update-notes">
+            <h4 id="update-notes-title">更新内容</h4>
+            <div id="update-notes-body" class="preview-content"></div>
+          </div>
+          <div class="update-progress hidden" id="update-progress-wrap">
+            <div class="progress-bar"><div class="progress-fill" id="update-progress-fill"></div></div>
+            <span id="update-progress-text">0%</span>
+          </div>
+        </div>
+        <div id="update-state-latest" class="hidden">
+          <div class="update-latest-card">
+            <div class="update-latest-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"></circle>
+                <path d="M8 12.5l2.5 2.5L16 9"></path>
+              </svg>
+            </div>
+            <h3 class="update-latest-title" id="update-latest-title">已是最新版本</h3>
+            <p class="update-latest-sub"><span id="update-latest-prefix">当前已是最新版本</span> <span id="update-latest-version" class="update-version-highlight"></span><span id="update-latest-suffix">，无需更新</span></p>
+          </div>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn" id="update-skip">稍后再说</button>
+        <button class="dialog-btn dialog-btn-primary" id="update-action" data-state="" disabled>正在检查...</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="save-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="save-dialog-title">
+    <div class="dialog save-dialog">
+      <div class="dialog-header">
+        <h2 id="save-dialog-title">保存更改</h2>
+      </div>
+      <div class="dialog-content">
+        <p id="save-dialog-message">文件已修改，是否保存？</p>
+      </div>
+      <div class="dialog-footer">
+        <button id="save-dialog-save" class="dialog-btn dialog-btn-primary">保存</button>
+        <button id="save-dialog-discard" class="dialog-btn">不保存</button>
+        <button id="save-dialog-cancel" class="dialog-btn">取消</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 通用输入对话框（文件树新建/重命名用，合并自 PR #36） -->
+  <div id="prompt-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="prompt-dialog-title">
+    <div class="dialog prompt-dialog">
+      <div class="dialog-header">
+        <h2 id="prompt-dialog-title">输入</h2>
+      </div>
+      <div class="dialog-content">
+        <p id="prompt-dialog-message"></p>
+        <input id="prompt-dialog-input" class="prompt-dialog-input" type="text" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="dialog-footer">
+        <button id="prompt-dialog-cancel" class="dialog-btn">取消</button>
+        <button id="prompt-dialog-confirm" class="dialog-btn dialog-btn-primary">确认</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="confirm-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-dialog-title">
+    <div class="dialog confirm-dialog">
+      <div class="dialog-header">
+        <h2 id="confirm-dialog-title">确认</h2>
+      </div>
+      <div class="dialog-content">
+        <div id="confirm-dialog-warning" class="dialog-warning hidden">
+          <span class="dialog-warning-icon" aria-hidden="true">⚠</span>
+          <span id="confirm-dialog-warning-text"></span>
+        </div>
+        <p id="confirm-dialog-message" style="white-space: pre-line;">确定要恢复默认设置吗？</p>
+      </div>
+      <div class="dialog-footer">
+        <button id="confirm-dialog-cancel" class="dialog-btn">取消</button>
+        <button id="confirm-dialog-confirm" class="dialog-btn dialog-btn-primary">确认</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 关闭窗口确认对话框 -->
+  <div id="close-confirm-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="close-dialog-title">
+    <div class="dialog close-confirm-dialog">
+      <div class="dialog-header">
+        <h2 id="close-dialog-title">关闭应用</h2>
+      </div>
+      <div class="dialog-content">
+        <p id="close-dialog-msg">请选择关闭应用时的操作：</p>
+        <label class="close-dialog-remember-label">
+          <input type="checkbox" id="close-dialog-remember">
+          <span id="close-dialog-remember-label-text">记住选择，不再询问</span>
+        </label>
+      </div>
+      <div class="dialog-footer">
+        <button id="close-dialog-minimize" class="dialog-btn">最小化到托盘</button>
+        <button id="close-dialog-quit" class="dialog-btn dialog-btn-primary">退出应用</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 导出 DOCX 确认框：只做说明 + 确认。纸张/方向/边距固定 A4/纵向/标准，
+       需要改的人在 Word「布局 → 页面设置」里改（导出前选是多余的一步）。 -->
+  <div id="docx-page-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="docx-page-title">
+    <div class="dialog docx-page-dialog">
+      <div class="dialog-header">
+        <h2 id="docx-page-title">导出 DOCX</h2>
+        <button class="dialog-close docx-page-cancel" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <p class="docx-page-tip"></p>
+        <p class="docx-page-warn"></p>
+      </div>
+      <div class="dialog-footer">
+        <button class="dialog-btn docx-page-cancel">取消</button>
+        <button class="dialog-btn dialog-btn-primary docx-page-ok">导出</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 插入链接对话框 -->
+  <div id="insert-link-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="insert-link-title">
+    <div class="dialog insert-link-dialog">
+      <div class="dialog-header">
+        <h2 id="insert-link-title">插入链接</h2>
+        <button class="dialog-close" id="insert-link-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <div class="form-field">
+          <label id="insert-link-text-label">显示文本</label>
+          <input id="insert-link-text" type="text" />
+        </div>
+        <div class="form-field">
+          <label id="insert-link-url-label">链接地址</label>
+          <input id="insert-link-url" type="text" placeholder="https://..." />
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="insert-link-cancel" class="dialog-btn">取消</button>
+        <button id="insert-link-ok" class="dialog-btn dialog-btn-primary">确定</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 插入图片对话框 -->
+  <div id="insert-image-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="insert-image-title">
+    <div class="dialog insert-image-dialog">
+      <div class="dialog-header">
+        <h2 id="insert-image-title">插入图片</h2>
+        <button class="dialog-close" id="insert-image-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <p class="form-hint" id="insert-image-store-hint">
+          <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+          <span class="hint-text"></span>
+        </p>
+        <div class="form-field">
+          <label id="insert-image-source-label">图片来源</label>
+          <div id="insert-image-source"></div>
+        </div>
+        <div class="form-field" id="insert-image-local-field">
+          <label id="insert-image-file-label" class="required">文件</label>
+          <div class="file-input-row">
+            <input id="insert-image-file" type="text" readonly />
+            <button id="insert-image-browse" class="dialog-btn">浏览...</button>
+          </div>
+        </div>
+        <div class="form-field hidden" id="insert-image-web-field">
+          <label id="insert-image-url-label" class="required">图片地址</label>
+          <input id="insert-image-url" type="text" placeholder="https://..." />
+        </div>
+        <div class="form-field" id="insert-image-alt-field">
+          <label id="insert-image-alt-label">替代文本</label>
+          <input id="insert-image-alt" type="text" />
+          <p class="form-hint" id="insert-image-alt-hint" data-i18n="imageAltHint">
+            <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            <span class="hint-text"></span>
+          </p>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="insert-image-cancel" class="dialog-btn">取消</button>
+        <button id="insert-image-ok" class="dialog-btn dialog-btn-primary">确定</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="shortcuts-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+    <div class="dialog shortcuts-dialog">
+      <div class="dialog-header dialog-drag-handle">
+        <h2 id="shortcuts-title">快捷键设置</h2>
+        <button class="dialog-close" id="shortcuts-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content shortcuts-content">
+        <div id="shortcuts-list" class="shortcuts-list"></div>
+      </div>
+      <div class="dialog-footer">
+        <button id="shortcuts-reset" class="dialog-btn">恢复默认</button>
+        <button id="shortcuts-save-btn" class="dialog-btn dialog-btn-primary">完成</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="cross-search-dialog" class="dialog-overlay cross-search-overlay hidden" role="dialog" aria-modal="false" aria-labelledby="cs-title">
+    <div class="dialog cross-search-dialog" id="cs-panel">
+      <div class="dialog-header cs-drag-handle" id="cs-drag-handle">
+        <h2 id="cs-title">跨文件搜索</h2>
+        <button class="dialog-close" id="cs-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content cs-content">
+        <div class="cs-scope">
+          <label><input type="radio" name="cs-scope" value="open" checked> <span id="cs-label-open">已打开文件</span></label>
+          <label><input type="radio" name="cs-scope" value="dir"> <span id="cs-label-dir">目录</span></label>
+        </div>
+        <div id="cs-dir-row" class="cs-dir-row hidden">
+          <input id="cs-dir" class="cs-input" placeholder="目录路径">
+          <button id="cs-browse" class="dialog-btn dialog-btn-primary">浏览</button>
+        </div>
+        <input id="cs-query" class="cs-input" placeholder="输入搜索内容...">
+        <div class="cs-options">
+          <label class="cs-check"><input type="checkbox" id="cs-case"> <span id="cs-label-case">区分大小写</span></label>
+          <label class="cs-check"><input type="checkbox" id="cs-regex"> <span id="cs-label-regex">正则</span></label>
+        </div>
+        <div id="cs-progress" class="cs-progress hidden"></div>
+        <div id="cs-total" class="cs-total"></div>
+        <div id="cs-results" class="cs-results"></div>
+      </div>
+      <div class="dialog-footer">
+        <button id="cs-run" class="dialog-btn dialog-btn-primary">搜索</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 文件搜索对话框 (VSCode 风格 Ctrl+P，合并自 PR #36)
+       浮动非模态面板 + 标题栏拖动；关闭方式：X 按钮、输入框 ESC、点击面板以外区域（VSCode 命令面板风格）。 -->
+  <div id="file-search-dialog" class="dialog-overlay file-search-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="file-search-title">
+    <div class="dialog file-search-dialog" id="fs-panel">
+      <div class="dialog-header fs-drag-handle" id="fs-drag-handle">
+        <h2 id="file-search-title">文件搜索</h2>
+        <button class="dialog-close" id="file-search-close" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <input type="text" id="file-search-input" class="file-search-input" placeholder="输入文件名筛选..." />
+        <div id="file-search-list" class="file-search-list"></div>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <div id="settings-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="dialog settings-dialog">
+      <div class="dialog-header dialog-drag-handle">
+        <h2 id="settings-title">设置</h2>
+        <button class="dialog-close" id="settings-close-x" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content settings-content">
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 21v-6" /><path d="M12 21V9" /><path d="M19 21V3" /></svg>
+            <span class="settings-section-name">基本</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row">
+            <label>界面语言</label>
+            <div id="set-language"></div>
+          </div>
+          <div class="settings-row">
+            <label>主题模式</label>
+            <div id="set-theme-mode"></div>
+          </div>
+          <div class="settings-row">
+            <label>配色方案</label>
+            <div id="set-color-scheme"></div>
+          </div>
+          </div>
+        </div>
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 18 6-6-6-6" /><path d="m8 6-6 6 6 6" /></svg>
+            <span class="settings-section-name">编辑器</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row">
+            <label>Tab 宽度</label>
+            <div id="set-tab-size"></div>
+            <p class="form-hint" id="setting-tab-size-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text"></span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>自动换行</label>
+            <label class="toggle"><input type="checkbox" id="set-line-wrap" checked><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <label>显示行号</label>
+            <label class="toggle"><input type="checkbox" id="set-line-numbers" checked><span class="toggle-slider"></span></label>
+          </div>
+          </div>
+        </div>
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" /><circle cx="12" cy="12" r="3" /></svg>
+            <span class="settings-section-name">预览</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row">
+            <label>行高</label>
+            <div id="set-line-height"></div>
+          </div>
+          <div class="settings-row">
+            <label>最大宽度</label>
+            <div id="set-max-width"></div>
+          </div>
+          <div class="settings-row">
+            <label>代码块行号</label>
+            <label class="toggle"><input type="checkbox" id="set-code-line-numbers"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <label>代码块自动换行</label>
+            <label class="toggle"><input type="checkbox" id="set-code-wrap"><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <label>代码块滚动条</label>
+            <label class="toggle"><input type="checkbox" id="set-code-scroll" checked><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-code-scroll-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text"></span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>自定义底色</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <label class="toggle"><input type="checkbox" id="set-custom-bg"><span class="toggle-slider"></span></label>
+              <input type="color" id="set-custom-bg-color" value="#f8f7f4" style="width:36px;height:26px;border:1px solid var(--border-color);border-radius:4px;padding:0;background:transparent;cursor:pointer">
+            </div>
+          </div>
+          </div>
+        </div>
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15.914 4a1.5 1.5 0 00-2.474-1.561l-9 9A1.5 1.5 0 005.5 14h4.002a.5.5 0 01.471.666L8.086 20a1.5 1.5 0 002.475 1.56l9-9A1.5 1.5 0 0018.5 10h-3.997a.5.5 0 01-.472-.667z" /></svg>
+            <span class="settings-section-name">行为</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row">
+            <label>默认视图</label>
+            <div id="set-default-view"></div>
+          </div>
+          <div class="settings-row">
+            <label>滚动同步</label>
+            <label class="toggle"><input type="checkbox" id="set-scroll-sync" checked><span class="toggle-slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <label>软换行（回车即换行）</label>
+            <label class="toggle"><input type="checkbox" id="set-soft-breaks" checked><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-soft-breaks-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text">开启后，段落内单个回车直接换行（与「空格+空格+回车」一致），更符合日常写作习惯，也便于从其他笔记软件迁移。关闭则恢复 CommonMark 标准（回车视为空格）。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>扩展语法高亮（==文字==）</label>
+            <label class="toggle"><input type="checkbox" id="set-extended-syntax" checked><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-extended-syntax-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text">开启后，==文字== 会渲染为黄色高亮（TizuMark 扩展语法）。关闭则 ==文字== 原样显示为普通文本，适合粘贴 AI 生成、未遵循该语法的 Markdown，避免被误当成高亮。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>公式按章节编号（2.1）</label>
+            <label class="toggle"><input type="checkbox" id="set-equation-section-numbering"><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-equation-section-numbering-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text">开启后，带 \label 的公式按「节.序号」编号，例如第 2 节的第一个公式为 (2.1)，并在每节内重新计数。关闭则全文连续编号 (1)(2)(3)。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>关闭窗口时</label>
+            <div id="set-close-action"></div>
+          </div>
+          <div class="settings-row">
+            <label>退出时关闭所有标签</label>
+            <label class="toggle"><input type="checkbox" id="set-clear-tabs-on-quit"><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-clear-tabs-on-quit-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M3 7h18" /><path d="M3 12h18" /><path d="M3 17h18" /></svg>
+              <span class="hint-text">开启后，退出应用时不保存标签会话，下次启动总是空白。关闭则恢复上次关闭时的标签。未保存的文档仍会照常弹提示。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label>显示托盘图标</label>
+            <label class="toggle"><input type="checkbox" id="set-show-tray-icon" checked><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-show-tray-icon-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text">关闭后隐藏系统托盘图标；此时点击窗口关闭按钮会直接退出应用（否则将无法通过托盘恢复窗口）。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label id="set-show-all-files-label">显示所有文件</label>
+            <label class="toggle"><input type="checkbox" id="set-show-all-files"><span class="toggle-slider"></span></label>
+            <p class="form-hint" id="setting-show-all-files-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M3 7h18" /><path d="M3 12h18" /><path d="M3 17h18" /></svg>
+              <span class="hint-text">关闭时文件树只列出软件能识别的格式（Markdown 7 种 / 图片 20 种 / 明文代码 145 种）；打开后显示目录内全部文件，包括不可打开的格式。文件夹始终会显示。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label id="set-image-store-mode-label">图片存储方式</label>
+            <div id="set-image-store-mode"></div>
+            <p class="form-hint" id="setting-image-store-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text">复制到 assets/：图片保存为独立文件，md 文件轻量，便于版本管理。Base64 嵌入：图片编码到 md 文件内，单文件即可分享，但文件体积显著增大（约原图1.4倍），修改图片需重新编码。</span>
+            </p>
+          </div>
+          <div class="settings-row">
+            <label id="set-image-asset-path-mode-label">图片存储路径</label>
+            <div id="set-image-asset-path-mode"></div>
+            <input type="text" id="settings-image-asset-path" value="assets" class="settings-text-input" />
+            <p class="form-hint" id="setting-image-asset-path-hint">
+              <svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg>
+              <span class="hint-text" id="setting-image-asset-path-hint-text">相对于 markdown 文件所在目录的路径。例如 <code>assets</code> → 图片将保存在 <code>docs/assets/</code>。将整个文件夹移动到其他位置后，路径仍然有效，无需额外操作。</span>
+            </p>
+          </div>
+          </div>
+        </div>
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v16" /><path d="M4 7V5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v2" /><path d="M9 20h6" /></svg>
+            <span class="settings-section-name">自定义字体</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row settings-row-stacked">
+            <button type="button" id="btn-add-font" class="dialog-btn dialog-btn-primary">添加字体…</button>
+          </div>
+          <div id="custom-font-list" class="custom-font-list"></div>
+          <div class="settings-row settings-row-stacked">
+            <button type="button" id="btn-retry-system-fonts" class="dialog-btn hidden"></button>
+          </div>
+          <div class="settings-row settings-row-stacked font-field">
+            <label>编辑器字体</label>
+            <div id="set-editor-font" class="font-picker-root"></div>
+            <div class="font-preview" id="font-preview-editor">
+              <span class="font-preview-caption" id="font-name-editor"></span>
+              <span class="font-preview-text">永和九年岁在癸丑 暮春之初 The quick brown fox 0123</span>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stacked font-field">
+            <label>预览字体</label>
+            <div id="set-preview-font" class="font-picker-root"></div>
+            <div class="font-preview" id="font-preview-preview">
+              <span class="font-preview-caption" id="font-name-preview"></span>
+              <span class="font-preview-text">永和九年岁在癸丑 暮春之初 ABC abc 123</span>
+            </div>
+          </div>
+          <div class="settings-row settings-row-stacked font-field">
+            <label>代码块字体</label>
+            <div id="set-code-font" class="font-picker-root"></div>
+            <div class="font-preview font-preview-code" id="font-preview-code">
+              <span class="font-preview-caption" id="font-name-code"></span>
+              <span class="font-preview-text">const answer = 42; function greet() { return '你好'; }</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label>界面字号</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="set-ui-font-size" min="11" max="18" step="1" value="13">
+              <span class="range-label" id="ui-font-size-label">13px</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label>编辑器字号</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="set-font-size" min="8" max="36" step="1" value="14">
+              <span class="range-label" id="font-size-label">14px</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label>编辑字重</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="set-editor-font-weight" min="100" max="900" step="10" value="400">
+              <span class="range-label" id="editor-font-weight-label">400</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label>预览字号</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="set-preview-font-size" min="8" max="36" step="1" value="16">
+              <span class="range-label" id="preview-font-size-label">16px</span>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label>预览字重</label>
+            <div style="display:flex;align-items:center;gap:8px">
+              <input type="range" id="set-preview-font-weight" min="100" max="900" step="10" value="400">
+              <span class="range-label" id="preview-font-weight-label">400</span>
+            </div>
+          </div>
+          </div>
+        </div>
+        <div class="settings-section" data-collapsed="false">
+          <div class="settings-section-title" data-toggle>
+            <svg class="panel-title-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18" /><path d="M3 12h18" /><path d="M3 18h18" /></svg>
+            <span class="settings-section-name">快捷插入</span>
+            <svg class="collapse-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </div>
+          <div class="settings-section-body">
+          <div class="settings-row">
+            <p class="form-hint"><svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg><span class="hint-text">在编辑器输入「/」时弹出快捷插入列表，可自定义顺序与显隐。</span></p>
+          </div>
+          <div class="settings-row">
+            <button type="button" id="btn-manage-slash" class="dialog-btn dialog-btn-primary">管理快捷插入…</button>
+          </div>
+          </div>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button id="settings-reset" class="dialog-btn">恢复默认</button>
+        <button id="settings-apply-btn" class="dialog-btn dialog-btn-primary">应用</button>
+        <button id="settings-save-btn" class="dialog-btn dialog-btn-primary">保存</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- slash 命令排序对话框 -->
+  <div id="slash-order-dialog" class="dialog-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="slash-order-title">
+    <div class="dialog slash-order-dialog">
+      <div class="dialog-header dialog-drag-handle">
+        <h2 id="slash-order-title">快捷插入顺序</h2>
+        <button class="dialog-close" id="slash-order-close-x" aria-label="关闭">&times;</button>
+      </div>
+      <div class="dialog-content">
+        <p class="form-hint"><svg class="hint-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M6 22a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h8a2.4 2.4 0 0 1 1.704.706l3.588 3.588A2.4 2.4 0 0 1 20 8v12a2 2 0 0 1-2 2z" /><path d="M14 2v5a1 1 0 0 0 1 1h5" /><path d="M10 9H8" /><path d="M16 13H8" /><path d="M16 17H8" /></svg><span class="hint-text">拖动手柄调整顺序，取消勾选可隐藏该项（隐藏后输入「/」不再出现）。</span></p>
+        <div id="slash-order-list" class="slash-order-list"></div>
+      </div>
+      <div class="dialog-footer">
+        <button id="slash-order-reset" class="dialog-btn">恢复默认</button>
+        <button id="slash-order-done" class="dialog-btn dialog-btn-primary">完成</button>
+      </div>
+      <div class="dialog-resize-handle" aria-hidden="true"></div>
+    </div>
+  </div>
+
+  <!-- 编辑器右键菜单 -->
+  <div id="context-menu-editor" class="context-menu hidden">
+    <div class="context-menu-item" data-action="cut"><span>剪切</span><span class="shortcut">Ctrl+X</span></div>
+    <div class="context-menu-item" data-action="copy"><span>复制</span><span class="shortcut">Ctrl+C</span></div>
+    <div class="context-menu-item" data-action="paste"><span>粘贴</span><span class="shortcut">Ctrl+V</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-structure">
+      <span>结构插入</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </div>
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-text-format">
+      <span>文本格式</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </div>
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-list">
+      <span>列表</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </div>
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-link-media">
+      <span>链接与媒体</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="find-replace"><span>查找替换</span><span class="shortcut">Ctrl+F</span></div>
+    <div class="context-menu-item" data-action="select-all"><span>全选</span><span class="shortcut">Ctrl+A</span></div>
+  </div>
+
+  <!-- 结构插入子菜单 -->
+  <div id="ctx-structure" class="context-menu submenu hidden">
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-heading"><span>标题</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></div>
+    <div class="context-menu-item" data-action="insert-code-block"><span>代码块</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-table"><span>表格</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-quote"><span>引用块</span><span class="shortcut"></span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item context-submenu-trigger" data-submenu="ctx-callout"><span>提示块</span><svg class="submenu-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></div>
+    <div class="context-menu-item" data-action="insert-math-block"><span>数学公式</span></div>
+    <div class="context-menu-item" data-action="insert-mermaid"><span>Mermaid 图表</span></div>
+    <div class="context-menu-item" data-action="insert-plantuml"><span>PlantUML 图</span></div>
+    <div class="context-menu-item" data-action="insert-d2"><span>D2 图</span></div>
+    <div class="context-menu-item" data-action="insert-tikz"><span>TikZ 绘图</span></div>
+    <div class="context-menu-item" data-action="insert-plot"><span>函数绘图</span></div>
+    <div class="context-menu-item" data-action="insert-markmap"><span>思维导图</span></div>
+    <div class="context-menu-item" data-action="insert-math-numbered"><span>编号公式</span></div>
+    <div class="context-menu-item" data-action="insert-siunitx"><span>物理量 (siunitx)</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="insert-hr"><span>水平线</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-toc"><span>目录 [TOC]</span></div>
+  </div>
+
+  <!-- 标题子菜单 -->
+  <div id="ctx-heading" class="context-menu submenu hidden">
+    <div class="context-menu-item" data-action="insert-h1"><span># 标题 1</span></div>
+    <div class="context-menu-item" data-action="insert-h2"><span>## 标题 2</span></div>
+    <div class="context-menu-item" data-action="insert-h3"><span>### 标题 3</span></div>
+    <div class="context-menu-item" data-action="insert-h4"><span>#### 标题 4</span></div>
+    <div class="context-menu-item" data-action="insert-h5"><span>##### 标题 5</span></div>
+    <div class="context-menu-item" data-action="insert-h6"><span>###### 标题 6</span></div>
+  </div>
+
+  <!-- 提示块子菜单 -->
+  <div id="ctx-callout" class="context-menu submenu hidden">
+    <div class="context-menu-item" data-action="insert-callout-note"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 9a2.4 2.4 0 0 0-.706-1.706l-3.588-3.588A2.4 2.4 0 0 0 15 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2z"/><path d="M15 3v5a1 1 0 0 0 1 1h5"/></svg><span>Note 提示</span></div>
+    <div class="context-menu-item" data-action="insert-callout-tip"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/><path d="M9 18h6"/><path d="M10 22h4"/></svg><span>Tip 建议</span></div>
+    <div class="context-menu-item" data-action="insert-callout-warning"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg><span>Warning 警告</span></div>
+    <div class="context-menu-item" data-action="insert-callout-caution"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16h.01"/><path d="M12 8v4"/><path d="M15.312 2a2 2 0 0 1 1.414.586l4.688 4.688A2 2 0 0 1 22 8.688v6.624a2 2 0 0 1-.586 1.414l-4.688 4.688a2 2 0 0 1-1.414.586H8.688a2 2 0 0 1-1.414-.586l-4.688-4.688A2 2 0 0 1 2 15.312V8.688a2 2 0 0 1 .586-1.414l4.688-4.688A2 2 0 0 1 8.688 2z"/></svg><span>Caution 注意</span></div>
+    <div class="context-menu-item" data-action="insert-callout-important"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg><span>Important 重要</span></div>
+    <div class="context-menu-item" data-action="insert-admonition"><span>Admonition 提示</span></div>
+    <div class="context-menu-item" data-action="insert-admonition-collapsible"><span>Admonition 折叠</span></div>
+  </div>
+
+  <!-- 文本格式子菜单 -->
+  <div id="ctx-text-format" class="context-menu submenu hidden">
+    <div class="context-menu-item" data-action="insert-bold"><span>加粗</span><span class="shortcut">Ctrl+B</span></div>
+    <div class="context-menu-item" data-action="insert-italic"><span>斜体</span><span class="shortcut">Ctrl+I</span></div>
+    <div class="context-menu-item" data-action="insert-strikethrough"><span>删除线</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-inline-code"><span>行内代码</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-highlight"><span>高亮</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-superscript"><span>上标</span></div>
+    <div class="context-menu-item" data-action="insert-subscript"><span>下标</span></div>
+  </div>
+
+  <!-- 列表子菜单 -->
+  <div id="ctx-list" class="context-menu submenu hidden">
+    <div class="context-menu-item" data-action="insert-ul"><span>无序列表</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-ol"><span>有序列表</span><span class="shortcut"></span></div>
+    <div class="context-menu-item" data-action="insert-task"><span>任务列表</span><span class="shortcut"></span></div>
+  </div>
+
+  <!-- 链接与媒体子菜单 -->
+  <div id="ctx-link-media" class="context-menu submenu hidden">
+    <div class="context-menu-item" data-action="insert-link"><span>链接</span><span class="shortcut">Ctrl+K</span></div>
+    <div class="context-menu-item" data-action="insert-image"><span>图片</span><span class="shortcut"></span></div>
+  </div>
+
+  <!-- 预览区域右键菜单 -->
+  <div id="context-menu-preview" class="context-menu hidden">
+    <div class="context-menu-item" data-action="preview-copy"><span>复制</span><span class="shortcut">Ctrl+C</span></div>
+    <div class="context-menu-item" data-action="preview-select-all"><span>全选</span><span class="shortcut">Ctrl+A</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="preview-copy-html"><span>复制为 HTML</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="preview-find"><span>在预览中查找</span><span class="shortcut"></span></div>
+  </div>
+
+  <!-- 标签页右键菜单 -->
+  <div id="context-menu-tab" class="context-menu hidden">
+    <div class="context-menu-item" data-action="tab-close"><span>关闭</span></div>
+    <div class="context-menu-item" data-action="tab-close-others"><span>关闭其他</span></div>
+    <div class="context-menu-item" data-action="tab-close-all"><span>关闭所有</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="tab-copy-path"><span>复制文件路径</span></div>
+    <div class="context-menu-item" data-action="tab-open-containing"><span>打开所在目录</span></div>
+  </div>
+
+  <!-- 文件树右键菜单：action 用 file- 前缀避免与编辑器菜单的 cut/copy/paste 冲突（合并自 PR #36） -->
+  <div id="context-menu-file-tree" class="context-menu hidden">
+    <div class="context-menu-item" data-action="file-new-file"><span>新建文件</span><span class="shortcut">Ctrl+Alt+N</span></div>
+    <div class="context-menu-item" data-action="file-new-folder"><span>新建文件夹</span><span class="shortcut">Ctrl+Shift+N</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="file-cut"><span>剪切</span><span class="shortcut">Ctrl+X</span></div>
+    <div class="context-menu-item" data-action="file-copy"><span>复制</span><span class="shortcut">Ctrl+C</span></div>
+    <div class="context-menu-item" data-action="file-paste"><span>粘贴</span><span class="shortcut">Ctrl+V</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="file-rename"><span>重命名</span><span class="shortcut">F2</span></div>
+    <div class="context-menu-item" data-action="file-copy-path"><span>复制路径</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="folder-open-containing"><span id="folder-open-label">打开所在目录</span></div>
+    <div class="context-menu-separator"></div>
+    <div class="context-menu-item" data-action="file-delete" style="color:var(--color-danger)"><span>删除</span><span class="shortcut">Delete</span></div>
+  </div>
+
+  <!-- 注：此处曾有一个「文件夹右键菜单」死标记（#context-menu-folder）—— 它从未被任何代码显示
+       （文件树统一用 #context-menu-file-tree，其中已含 folder-open-containing 项），且与 file-tree
+       菜单各自持有一个同名的「打开所在目录」标签节点（重复 id 会让 getElementById 静默取到另一个
+       元素）。2026-09-25 第十一轮体检确认其零引用后删除。 -->
+
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loading-box">
+      <img class="loading-logo" src="app-icon.png" alt="TizuMark">
+      <div class="loading-progress-track">
+        <div id="loading-progress-fill" class="loading-progress-fill"></div>
+      </div>
+      <span class="loading-text" id="loading-text">加载中…</span>
+    </div>
+  </div>
+
+<script src="lib/unified-bundle.js"></script>
+<script src="lib/md-links.js"></script>
+<!-- docx 真 OOXML 库 / mathml2omml：**不在启动期加载**（仅 Word 导出需要，合计约 1MB），
+     改由 export.js 在首次导出时按需加载（_ensureDocxLibLoaded / _ensureMathmlLibLoaded）：
+     不用 Word 导出的用户免付启动解析与常驻内存成本；Worker 路径自带 docx 库、不依赖主线程加载。 -->
+<script src="modules/runtime.js"></script>
+<script src="modules/code-block.js"></script>
+<script src="modules/preview-post.js"></script>
+<script src="modules/diagram-converters.js"></script>
+<script src="modules/diagram-renderers.js"></script>
+<script src="modules/word-count.js"></script>
+<script src="modules/outline.js"></script>
+<script src="modules/dialogs.js"></script>
+<script src="modules/find-replace.js"></script>
+<script src="modules/preview-window.js"></script>
+<script src="modules/tauri-api.js"></script>
+<script src="modules/constants.js"></script>
+<script src="modules/file-types.js"></script>
+<script src="modules/file-search.js"></script>
+<script src="modules/dialog-drag-resize.js"></script>
+<script src="modules/image-processor.js"></script>
+<script src="modules/font-picker.js"></script>
+<script src="modules/select.js"></script>
+<script src="modules/export-docx.js"></script>
+<script src="modules/docx-builder.js"></script>
+<script src="modules/i18n-data.js"></script>
+<script src="modules/i18n.js"></script>
+<script src="modules/settings.js"></script>
+<script src="modules/layout.js"></script>
+<script src="modules/theme.js"></script>
+<script src="modules/font.js"></script>
+<script src="modules/shortcuts.js"></script>
+<script src="modules/editor-core.js"></script>
+<script src="modules/tabs.js"></script>
+<script src="modules/find.js"></script>
+<script src="modules/misc-ui.js"></script>
+<script src="modules/files.js"></script>
+<script src="modules/export.js"></script>
+<script src="modules/preview-sync.js"></script>
+<script src="modules/notify.js"></script>
+<script src="modules/updater.js"></script>
+<script src="modules/format.js"></script>
+<script src="modules/context-menu.js"></script>
+<script src="modules/slash.js"></script>
+<script src="modules/lifecycle.js"></script>
+<script src="modules/toolbar.js"></script>
+<script src="controllers/preview-controller.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

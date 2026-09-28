@@ -1,0 +1,777 @@
+// 标签页管理与最近文件/工作区
+// 从 src/app.js 拆分而来：方法体原样搬运，经 mixin 挂到 MarkdownEditor.prototype，
+// 因此方法内的 this 仍指向编辑器实例，模块之间可继续用 this.xxx() 互调。
+(function () {
+  'use strict';
+  const { Tab, dialogSave } = TMConst;
+
+  const mixin = {
+      async ensureTabLoaded(tab) {
+        if (!tab) return;
+        if (tab._loaded || !tab.filePath) { tab._loaded = true; return; }
+        // 图片不读文本：内容由预览面板经 fetchImageAsBase64 从路径渲染，按文本读会污染 tab.content（乱码）
+          if (tab.kind === 'image') { tab.content = ''; tab._loaded = true; return; }
+        try {
+          const content = await this.readFileNormalized(tab.filePath);
+          tab.content = content;
+          tab.savedContent = content;
+          // 读盘成功即解除失败标记。_loadError 的语义是「当前 content/savedContent 不来自磁盘」，
+          // 只在成功读取时清除 —— 只置位不清除会让保存安全闸（files.js _saveBlockReason）把标签永久锁死。
+          tab._loadError = false;
+          await this.refreshFileMeta(tab);
+        } catch (e) {
+          // 懒加载失败（文件被删/锁定/无权限）：标记错误并提示，避免静默空白
+          tab._loadError = true;
+          tab.content = '';
+          tab.savedContent = '';
+          this.reportError(e.code || 'E_IO', { context: { path: tab.filePath }, error: e, params: e.params, detail: e.detail });
+        }
+        tab._loaded = true;
+      },
+      // 切换/打开/重载文档后，恢复该 tab 记忆的滚动位置（编辑器 + 预览）。
+      // 统一临时关闭滚动同步，避免恢复过程中的程序化滚动事件互相重定位，导致
+      // 「切换标签页后预览/页面跳到别处」。下一帧再恢复滚动同步，交还给用户。
+      _restoreSwitchScroll(restoreScroll, restorePreviewTop) {
+        this._canScroll.editor = false;
+        this._canScroll.preview = false;
+        this.cm.scrollTo(restoreScroll.left || 0, restoreScroll.top || 0);
+        const maxScroll = Math.max(this.preview.scrollHeight - this.preview.clientHeight, 0);
+        this.preview.scrollTop = Math.min(restorePreviewTop || 0, maxScroll);
+        setTimeout(() => this._resumeScroll(), 0);
+      },
+      async switchTab(index) {
+        if (index === this.activeTabIndex || index < 0 || index >= this.tabs.length) return;
+
+        // 图表/图片查看器挂在 document.body 上，不会随预览重渲染消失 ——
+        // 切标签前强制关闭，避免它浮在别的文档上面（用户报障，见 closeLightbox）。
+        if (typeof this.closeLightbox === 'function') this.closeLightbox();
+        this._largeFileNoticeDismissed = false;
+        this._previewFocusLine = 0;
+        this.previewWindow = null;
+        // 换文档必须复位虚拟滚动的两项度量（审计发现，2026-09-24）：
+        //   · 待触发的滚动重渲染定时器：否则它会在新文档上按旧映射触发一次多余/错误焦点的重渲染
+        //   · 平均行高：它只校准一次后恒定，跨文档复用会让 spacer 高度与滚动落点系统性偏移
+        if (this._virtualRenderTimer) { clearTimeout(this._virtualRenderTimer); this._virtualRenderTimer = null; }
+        this._avgLineHeight = null;
+        // 切换代际号：加载文件是异步的，期间用户可能又点了别的标签 —— 下面每个 await 之后都要
+        // 校验代际，过期就放弃（否则旧续体会把内容写回编辑器，覆盖用户真正想看的文件）。
+        const gen = ++this._switchGen;
+        // 不再无条件显示加载层：大文档的 loading 由 render() 按 needLoad 自行接管；
+        // 否则每次切 tab（含小文档、渲染缓存命中）都会闪一下半透明白色遮罩（2026-09-25 修复）。
+        let beganPaneLoad = false;
+        try {
+          // 只把编辑器内容写回**真正承载它的那个标签**（this._editorTab）：此刻 activeTabIndex
+          // 可能已经前移、而编辑器里仍是上一个文档。旧写法（写进 this.activeTab）在"快速连点两个
+          // 标签、第一个还在读盘"时会把 A 的文本写进尚未加载的 B，B 的续体再把它写回编辑器
+          // → 内容被静默覆盖（审计发现，2026-09-24）。
+          // 回退规则：优先 _editorTab（编辑器真正承载的标签）；启动期它可能尚未建立，则回退
+          // activeTab —— 但**绝不回退到"正在加载中"的标签**（`_loaded === false`）：那正是审计
+          // 复核发现的错写场景（把上一个文档的光标/滚动写进还没加载完的标签）。
+          // 注：取消回退曾把"切走前保存当前滚动位置"整条打断（CI 的 tab-scroll 用例变红）。
+          // 注 2：**不清空 _editorTab** —— 加载期间编辑器里仍是旧标签的内容，只有它还是
+          // "真正承载者"，editor-core 的 change/cursor 处理器也据此回写。
+          let oldTab = this._editorTab;
+          // ⚠ _editorTab 可能指向**已被移除的死标签**（关闭标签 / 会话重建 / 测试直接改 tabs）。
+          // 此时它是 truthy，若不判有效性就会挡住下面的回退 → "切走前保存当前滚动位置"整条被跳过
+          // （CI 的 tab-scroll 两个用例都因此拿到 0 —— 审计复核已提示这条残余，2026-09-24）。
+          if (oldTab && this.tabs.indexOf(oldTab) < 0) oldTab = null;
+          if (!oldTab && this.activeTab && this.activeTab._loaded !== false) oldTab = this.activeTab;
+          if (oldTab && this.tabs.indexOf(oldTab) >= 0 && this.cm) {
+            oldTab.content = this.cm.getValue();
+            oldTab.cursorPos = this.cm.getCursor();
+            oldTab.scrollPos = { top: this.cm.getScrollInfo().top, left: this.cm.getScrollInfo().left };
+            oldTab.previewScrollTop = this.preview.scrollTop;
+          }
+
+          this.activeTabIndex = index;
+          const newTab = this.activeTab;
+          // 编辑器字号为全局（editorZoom），切 tab 不改变字号
+          this.hideZoomHint();
+  
+          if (!newTab._loaded && newTab.filePath) {
+            await this.ensureTabLoaded(newTab);
+          }
+          // 读盘期间用户又切走了 → 本次切换已过期，交给更新的那次处理
+          if (gen !== this._switchGen) return;
+  
+          // 关键：先把恢复值读到局部变量。setValue 会同步触发 scroll / cursorActivity 事件，
+          // 此刻 this.activeTab 已是 newTab，事件处理器会把 newTab.scrollPos / cursorPos 覆盖为 0，
+          // 所以恢复必须用这里的快照副本，不能再回头读 newTab.*（否则会读到被污染的 0 → 回到顶部）。
+          const restoreCursor = newTab.cursorPos || { line: 0, ch: 0 };
+          const restoreScroll = newTab.scrollPos || { top: 0, left: 0 };
+          const restorePreviewTop = newTab.previewScrollTop || 0;
+  
+          // 编辑器此刻承载的就是 newTab（供下一次切换正确回写内容）。
+          // ⚠ 必须在 setValue **之前**赋值：setValue 会同步触发 editor-core 的 change 处理器，
+          // 它按 _editorTab 回写 content —— 若此刻仍指向旧标签，会把新文档内容写进旧标签；
+          // 切到空内容标签（如未命名）时更是把旧标签的 content 清成 ''，之后再切回来
+          // 就是「编辑器整页空白、很久才恢复」（2026-09-25 用户报障的稳定根因）。
+          this._editorTab = newTab;
+          if (newTab.kind === 'image') {
+            this.cm.setValue('');
+          } else {
+            this.cm.setValue(newTab.content || '');
+            const newExt = (newTab.filePath && window.FileTypes && window.FileTypes.extOf)
+              ? window.FileTypes.extOf(newTab.filePath)
+              : (newTab.kind === 'markdown' ? 'md' : '');
+            this._applyCodeMode(newExt, newTab.content || '');
+          }
+          clearTimeout(this.debounceTimer);
+          this.cm.setCursor(restoreCursor);
+          this.cm.clearHistory();
+  
+          this.updateTabDisplay();
+          // 编辑器此刻内容 === newTab.content（上面刚 setValue），直接传入，省掉 render() 内部的
+          // 一次 O(N) cm.getValue()（大文档切 tab 的成本放大器，2026-09-26）。
+          await this.updatePreview(false, newTab.content || '');
+          // 统一恢复该 tab 记忆的编辑器/预览滚动位置。临时关闭滚动同步，避免恢复过程中
+          // 程序化滚动事件互相重定位（分屏 + 滚动同步开启时预览会被编辑器同步覆盖，
+          // 表现为「切换后预览/页面跳到别处」）。
+          // ⚠ 这里之前**不能**插"代际过期就 return"的判定：一旦 return 掉，滚动位置永远不会恢复
+          // （CI 的 tab-scroll 用例正是钉住这一条）。代际校验只放在 ensureTabLoaded 之后。
+          this._restoreSwitchScroll(restoreScroll, restorePreviewTop);
+          // 编辑器内容此刻等于 newTab.content；直接传入，省去 updateWordCount/updateOutline 各自
+          // 再来一次 O(N) 的 cm.getValue()（大文档切 tab 的关键放大器，2026-09-26）。
+          this.updateWordCount(newTab.content || '');
+          this.updateOutline(newTab.content || '');
+          this.updateExternalChangeBanner();
+          this.highlightTreeActiveFile();
+          this.syncViewModeToTab();
+        } finally {
+          if (beganPaneLoad) this._endPaneLoad();
+        }
+      },
+      async addTab(name = '', content = '', filePath = null, kind = 'markdown') {
+        const defaultName = this.t('untitled');
+        if (!name || name === defaultName) {
+          name = `${defaultName}${this.untitledCounter++}`;
+        }
+        content = content.replace(/\r\n/g, '\n');
+        const tab = new Tab(name, content, filePath, kind);
+        this.tabs.push(tab);
+        this.refreshFileMeta(tab);
+        await this.switchTab(this.tabs.length - 1);
+        this.updateTabBar();
+        try {
+          if (filePath) this.addRecentFile(filePath);
+        } catch (e) {
+          console.error('[TizuMark] addRecentFile failed:', e);
+        }
+        this.saveSession();
+      },
+      async closeTab(index) {
+        if (index < 0 || index >= this.tabs.length) return;
+
+        // 同上：关掉文档时也必须收掉查看器，否则它继续浮在其他文档之上。
+        if (typeof this.closeLightbox === 'function') this.closeLightbox();
+        const tab = this.tabs[index];
+        if (tab.isModified) {
+          const result = await this.showSaveDialog(this.t('saveChanges'), `${tab.name} ${this.t('fileModified')}`);
+          if (result === 'cancel') return;
+          if (result === 'save') {
+            const savedIndex = this.tabs.indexOf(tab);
+            if (savedIndex === -1) return;
+            try {
+              if (!tab.filePath) {
+                const path = await dialogSave({
+                  filters: [
+                    { name: 'Markdown', extensions: ['md'] },
+                    { name: this.t('allFiles'), extensions: ['*'] }
+                  ]
+                });
+                if (!path) return;
+                tab.filePath = path;
+                tab.name = path.split(/[/\\]/).pop();
+              }
+              // 源文件含无法解码字节：拦截，避免关窗保存把替换字符写回覆盖原文件。
+              const loss = this._encodingLossBlockReason(tab.filePath);
+              if (loss) { this.showToast(loss, 'warning'); return; }
+              await TauriApi.writeFile(this.fileSaveArgs(tab.filePath, tab.content));
+              tab.savedContent = tab.content;
+              await this.refreshFileMeta(tab);
+              this.setStatus(`${this.t('saved')}: ${tab.filePath}`);
+            } catch (error) {
+              this._reportSaveError(error, tab.filePath);
+              return;
+            }
+          }
+        }
+  
+        const removeIndex = this.tabs.indexOf(tab);
+        if (removeIndex === -1) return;
+  
+        if (this._externalQueue) this._externalQueue = this._externalQueue.filter(t => t !== tab);
+        this.tabs.splice(removeIndex, 1);
+        if (this.tabs.length === 0) {
+          this.tabs.push(new Tab(`${this.t('untitled')}${this.untitledCounter++}`));
+          this.activeTabIndex = 0;
+          this.cm.setValue('');
+        } else {
+          if (removeIndex < this.activeTabIndex) {
+            this.activeTabIndex--;
+          } else if (this.activeTabIndex >= this.tabs.length) {
+            this.activeTabIndex = this.tabs.length - 1;
+          }
+        }
+        this.updateTabBar(removeIndex);
+        // 编辑器此刻承载的就是 activeTab：不更新的话 _editorTab 仍指向刚移除的死标签，
+        // 关闭后立刻输入的内容会在下次 switchTab 时被当作"旧标签内容"错写/丢失
+        //（与 1c782cb 修的 change 回写污染同源，2026-09-25 审计补齐）。
+        this._editorTab = this.activeTab;
+        if (this.tabs.length > 0) {
+          await this.ensureTabLoaded(this.activeTab);
+          this.cm.setValue(this.activeTab.content || '');
+          this._syncEditorModeFor(this.activeTab);
+          this.cm.setCursor(this.activeTab.cursorPos || { line: 0, ch: 0 });
+          this.updatePreview();
+        }
+        this.saveSession();
+      },
+      // ---- 标签页拖拽排序 ----
+      reorderTab(from, to) {
+        if (from === to || from < 0 || from >= this.tabs.length || to < 0 || to >= this.tabs.length) return;
+        const [moved] = this.tabs.splice(from, 1);
+        this.tabs.splice(to, 0, moved);
+        // 跟踪 activeTab 跟随移动
+        if (this.activeTabIndex === from) {
+          this.activeTabIndex = to;
+        } else if (from < this.activeTabIndex && to >= this.activeTabIndex) {
+          this.activeTabIndex--;
+        } else if (from > this.activeTabIndex && to <= this.activeTabIndex) {
+          this.activeTabIndex++;
+        }
+        this._tabBarForceFull = true; // 顺序变了，必须全量重建（增量路径不重排位置）
+        this.updateTabBar();
+        this.saveSession();
+      },
+      // 拖拽排序辅助（基于指针事件，不依赖原生 HTML5 DnD）
+      _tabElAt(index) {
+        return document.querySelector(`.tab[data-index="${index}"]`);
+      },
+      _tabIndexAtPoint(x, y) {
+        const el = document.elementFromPoint(x, y);
+        if (!el) return null;
+        const tab = el.closest('.tab');
+        if (!tab || tab.dataset.index == null) return null;
+        return parseInt(tab.dataset.index, 10);
+      },
+      _startTabDrag(from) {
+        const tab = this._tabElAt(from);
+        if (tab) tab.classList.add('dragging');
+        document.body.style.userSelect = 'none';
+      },
+      _updateTabDragTarget(x, y) {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('drag-over'));
+        const idx = this._tabIndexAtPoint(x, y);
+        if (idx != null) {
+          const t = this._tabElAt(idx);
+          if (t) t.classList.add('drag-over');
+        }
+      },
+      _endTabDrag() {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('drag-over', 'dragging'));
+        document.body.style.userSelect = '';
+      },
+      // ---- 最近文件 ----
+      loadRecentFiles() {
+        try {
+          const raw = localStorage.getItem('tizumark-recent-files');
+          const arr = raw ? JSON.parse(raw) : [];
+          this._recentFiles = Array.isArray(arr) ? arr.filter(p => typeof p === 'string') : [];
+        } catch {
+          this._recentFiles = [];
+        }
+      },
+      saveRecentFiles() {
+        try {
+          localStorage.setItem('tizumark-recent-files', JSON.stringify(this._recentFiles || []));
+        } catch {}
+      },
+      addRecentFile(filePath) {
+        if (!filePath) return;
+        const list = this._recentFiles || (this._recentFiles = []);
+        const idx = list.indexOf(filePath);
+        if (idx !== -1) list.splice(idx, 1);
+        list.unshift(filePath);
+        if (list.length > 10) list.length = 10;
+        this.saveRecentFiles();
+        if (this._recentSubmenuVisible) this.renderRecentFilesSubmenu();
+      },
+      clearRecentFiles() {
+        this._recentFiles = [];
+        this.saveRecentFiles();
+        if (this._recentSubmenuVisible) this.renderRecentFilesSubmenu();
+      },
+      loadRecentWorkspaces() {
+        try {
+          const raw = localStorage.getItem('tizumark-recent-workspaces');
+          const arr = raw ? JSON.parse(raw) : [];
+          this._recentWorkspaces = Array.isArray(arr) ? arr.filter(p => typeof p === 'string') : [];
+        } catch {
+          this._recentWorkspaces = [];
+        }
+      },
+      saveRecentWorkspaces() {
+        try {
+          localStorage.setItem('tizumark-recent-workspaces', JSON.stringify(this._recentWorkspaces || []));
+        } catch {}
+      },
+      addRecentWorkspace(folderPath) {
+        if (!folderPath) return;
+        const list = this._recentWorkspaces || (this._recentWorkspaces = []);
+        const idx = list.indexOf(folderPath);
+        if (idx !== -1) list.splice(idx, 1);
+        list.unshift(folderPath);
+        if (list.length > 10) list.length = 10;
+        this.saveRecentWorkspaces();
+        if (this._recentWorkspacesSubmenuVisible) this.renderRecentWorkspacesSubmenu();
+      },
+      clearRecentWorkspaces() {
+        this._recentWorkspaces = [];
+        this.saveRecentWorkspaces();
+        if (this._recentWorkspacesSubmenuVisible) this.renderRecentWorkspacesSubmenu();
+      },
+      async refreshRecentFiles() {
+        if (!this._recentFiles || this._recentFiles.length === 0) return;
+        const fileMenu = document.getElementById('file-menu');
+        if (!fileMenu || fileMenu.classList.contains('hidden')) return;
+        const paths = this._recentFiles.slice();
+        // 批量取 meta（一次 IPC 取代逐个 file_meta）；不可用则逐个兜底。
+        let metas = null;
+        try {
+          const res = await TauriApi.fileMetaBatch({ paths });
+          if (Array.isArray(res) && res.length === paths.length) metas = res;
+        } catch (_) { metas = null; }
+        let changed = false;
+        const survivors = [];
+        for (let i = 0; i < paths.length; i++) {
+          const p = paths[i];
+          let exists = true;
+          if (metas) {
+            const item = metas[i];
+            // error 视为「查询失败」保守保留；meta 为 null 才是文件已不存在
+            exists = (!item || item.error) ? true : (item.meta !== null && item.meta !== undefined);
+          } else {
+            try {
+              const meta = await TauriApi.fileMeta({ path: p });
+              exists = meta !== null && meta !== undefined;
+            } catch {
+              exists = true; // 查询失败保守保留，避免误删
+            }
+          }
+          if (exists) survivors.push(p); else changed = true;
+        }
+        if (changed) {
+          this._recentFiles = survivors;
+          this.saveRecentFiles();
+          this.renderRecentFilesSubmenu();
+        }
+      },
+      hideRecentSubmenu() {
+        const sm = document.getElementById('recent-files-submenu');
+        if (sm) sm.classList.add('hidden');
+        this._recentSubmenuVisible = false;
+      },
+      showRecentSubmenu() {
+        const trigger = document.getElementById('btn-recent');
+        const submenu = document.getElementById('recent-files-submenu');
+        if (!trigger || !submenu) return;
+        this.hideRecentWorkspacesSubmenu(); // 与最近工作区子菜单互斥，避免重叠遮盖
+        this.renderRecentFilesSubmenu();
+        submenu.classList.remove('hidden');
+        this._recentSubmenuVisible = true;
+        this.positionSubmenu(trigger, submenu);
+      },
+      positionSubmenu(trigger, submenu) {
+        if (!trigger || !submenu) return;
+        const rect = trigger.getBoundingClientRect();
+        submenu.style.left = (rect.right - 1) + 'px';
+        submenu.style.top = rect.top + 'px';
+        requestAnimationFrame(() => {
+          const sr = submenu.getBoundingClientRect();
+          if (sr.right > window.innerWidth) submenu.style.left = (rect.left - sr.width + 1) + 'px';
+          if (sr.bottom > window.innerHeight) submenu.style.top = (window.innerHeight - sr.height - 4) + 'px';
+        });
+      },
+      renderRecentWorkspacesSubmenu() {
+        const submenu = document.getElementById('recent-workspaces-submenu');
+        if (!submenu) return;
+        const list = this._recentWorkspaces || [];
+        submenu.innerHTML = '';
+        if (list.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'dropdown-item disabled';
+          empty.textContent = this.t('noRecentWorkspaces');
+          submenu.appendChild(empty);
+          return;
+        }
+        list.forEach(p => {
+          const item = document.createElement('div');
+          item.className = 'dropdown-item recent-file-item recent-workspace-item';
+          item.dataset.path = p;
+          const name = p.split(/[/\\]/).pop() || p;
+          const dir = p.slice(0, Math.max(0, p.length - name.length)).replace(/[/\\]$/, '');
+          const nameEl = document.createElement('span');
+          nameEl.className = 'recent-file-name recent-workspace-name';
+          nameEl.textContent = name;
+          const dirEl = document.createElement('span');
+          dirEl.className = 'recent-file-dir recent-workspace-dir';
+          dirEl.textContent = dir;
+          item.appendChild(nameEl);
+          item.appendChild(dirEl);
+          item.title = p;
+          submenu.appendChild(item);
+        });
+        const sep = document.createElement('div');
+        sep.className = 'dropdown-separator';
+        submenu.appendChild(sep);
+        const clear = document.createElement('div');
+        clear.className = 'dropdown-item recent-clear recent-workspace-clear';
+        clear.dataset.action = 'clear';
+        clear.textContent = this.t('clearRecentWorkspaces');
+        submenu.appendChild(clear);
+      },
+      showRecentWorkspacesSubmenu() {
+        const trigger = document.getElementById('btn-recent-workspaces');
+        const submenu = document.getElementById('recent-workspaces-submenu');
+        if (!trigger || !submenu) return;
+        this.hideRecentSubmenu(); // 与最近文件子菜单互斥，避免重叠遮盖
+        this.renderRecentWorkspacesSubmenu();
+        submenu.classList.remove('hidden');
+        this._recentWorkspacesSubmenuVisible = true;
+        this.positionSubmenu(trigger, submenu);
+      },
+      hideRecentWorkspacesSubmenu() {
+        const sm = document.getElementById('recent-workspaces-submenu');
+        if (sm) sm.classList.add('hidden');
+        this._recentWorkspacesSubmenuVisible = false;
+      },
+      renderRecentFilesSubmenu() {
+        const submenu = document.getElementById('recent-files-submenu');
+        if (!submenu) return;
+        const list = this._recentFiles || [];
+        submenu.innerHTML = '';
+        if (list.length === 0) {
+          const empty = document.createElement('div');
+          empty.className = 'dropdown-item disabled';
+          empty.textContent = this.t('noRecentFiles');
+          submenu.appendChild(empty);
+          return;
+        }
+        list.forEach(p => {
+          const item = document.createElement('div');
+          item.className = 'dropdown-item recent-file-item';
+          item.dataset.path = p;
+          const name = p.split(/[/\\]/).pop() || p;
+          const dir = p.slice(0, Math.max(0, p.length - name.length)).replace(/[/\\]$/, '');
+          const nameEl = document.createElement('span');
+          nameEl.className = 'recent-file-name';
+          nameEl.textContent = name;
+          const dirEl = document.createElement('span');
+          dirEl.className = 'recent-file-dir';
+          dirEl.textContent = dir;
+          item.appendChild(nameEl);
+          item.appendChild(dirEl);
+          item.title = p;
+          submenu.appendChild(item);
+        });
+        const sep = document.createElement('div');
+        sep.className = 'dropdown-separator';
+        submenu.appendChild(sep);
+        const clear = document.createElement('div');
+        clear.className = 'dropdown-item recent-clear';
+        clear.dataset.action = 'clear';
+        clear.textContent = this.t('clearRecentFiles');
+        submenu.appendChild(clear);
+      },
+      // 构建单个标签元素（含 per-tab 监听）。监听统一读取 el.dataset.index（而非闭包 i），
+      // 这样增量更新改了 data-index 后，旧元素的点击/关闭仍指向正确标签。
+      _buildTabEl(tab, index, addBtn) {
+        const tabEl = document.createElement('div');
+        tabEl.className = `tab${index === this.activeTabIndex ? ' active' : ''}${tab.isModified ? ' modified' : ''}`;
+        tabEl.dataset.index = String(index);
+        tabEl.setAttribute('role', 'tab');
+        tabEl.setAttribute('aria-selected', index === this.activeTabIndex ? 'true' : 'false');
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'tab-name';
+        nameSpan.textContent = tab.name;
+        tabEl.appendChild(nameSpan);
+
+        if (this.tabs.length > 1) {
+          const closeBtn = document.createElement('span');
+          closeBtn.className = 'tab-close';
+          closeBtn.textContent = '×';
+          closeBtn.setAttribute('role', 'button');
+          closeBtn.setAttribute('aria-label', this.t('closeAria'));
+          closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            this.closeTab(Number(tabEl.dataset.index));
+          });
+          tabEl.appendChild(closeBtn);
+        }
+
+        tabEl.addEventListener('click', () => {
+          if (this._suppressClick) { this._suppressClick = false; return; }
+          this.switchTab(Number(tabEl.dataset.index));
+        });
+        // 中键点击关闭标签页；左键按下准备拖拽排序（用指针事件实现，绕过 Tauri 默认 dragDropEnabled 接管原生 DnD 导致拖不动的问题）
+        tabEl.addEventListener('mousedown', (e) => {
+          this._suppressClick = false;
+          const idx = Number(tabEl.dataset.index);
+          if (e.button === 1) { e.preventDefault(); this.closeTab(idx); return; }
+          if (e.button === 0) {
+            this._dragState = { from: idx, startX: e.clientX, startY: e.clientY, active: false };
+          }
+        });
+        // 鼠标悬停显示完整路径（含文件名）；未保存标签无 filePath 时回退文件名
+        tabEl.title = tab.filePath || tab.name;
+        return tabEl;
+      },
+
+      // 全量重建标签栏（结构变化：初始化 / 增删多 / 重排）。单次 O(N)，非 O(N²)。
+      _renderTabBarFull() {
+        const tabBar = document.getElementById('tab-bar');
+        const addBtn = document.getElementById('btn-add-tab');
+        const fragment = document.createDocumentFragment();
+        this.tabs.forEach((tab, i) => {
+          fragment.appendChild(this._buildTabEl(tab, i, addBtn));
+        });
+        tabBar.replaceChildren(fragment);
+        if (addBtn) tabBar.appendChild(addBtn);
+        if (this.updateTabScrollArrows) this.updateTabScrollArrows();
+      },
+
+      // 增量更新标签栏：避免「开 / 关很多标签」时每次全量重建导致 O(N²)。
+      //   · 数量不变：仅就地更新类 / 名 / title（不重建、不重绑监听）
+      //   · 多一个（addTab 末尾追加）：只 append 一个元素
+      //   · 少一个（closeTab，且剩余 ≥2）：移除指定 index 并重排后续 data-index
+      //   · 其余（重排 / 批量增删 / 单标签收尾）：走全量重建
+      updateTabBar(removedIndex) {
+        const tabBar = document.getElementById('tab-bar');
+        const addBtn = document.getElementById('btn-add-tab');
+        const existing = Array.from(tabBar.querySelectorAll('.tab'));
+        const n = this.tabs.length;
+        // 全量重建兜底：首次（无元素）/ 单标签收尾（需校正关闭按钮）/ 结构不匹配 / 强制
+        if (this._tabBarForceFull || existing.length === 0 || n <= 1 ||
+            existing.length > n + 1 || existing.length < n - 1) {
+          this._tabBarForceFull = false;
+          this._renderTabBarFull();
+          return;
+        }
+        if (existing.length === n) {
+          // 顺序一致性守卫：DOM 顺序与 tabs 不一致（异常路径残留）时，全量重建纠正，
+          // 避免"原地按位置改名"把标签名/激活态贴到错误的元素上（表现为顺序错乱）。
+          if (existing.some((el, i) => el.dataset.index !== String(i))) {
+            this._renderTabBarFull();
+            return;
+          }
+          // 数量一致：原地更新类 / 名 / title（顺序未变）
+          this.tabs.forEach((tab, i) => {
+            const el = existing[i];
+            if (!el) return;
+            el.className = `tab${i === this.activeTabIndex ? ' active' : ''}${tab.isModified ? ' modified' : ''}${tab.pendingExternalChange ? ' external-change' : ''}`;
+            el.setAttribute('aria-selected', i === this.activeTabIndex ? 'true' : 'false');
+            const nameSpan = el.querySelector('.tab-name');
+            if (nameSpan) nameSpan.textContent = tab.name;
+            el.title = tab.filePath || tab.name;
+          });
+          if (this.updateTabScrollArrows) this.updateTabScrollArrows();
+          return;
+        }
+        if (existing.length === n - 1) {
+          // 新增一个：末尾追加（addTab 始终 push 到末尾）
+          const tab = this.tabs[n - 1];
+          const el = this._buildTabEl(tab, n - 1, addBtn);
+          tabBar.insertBefore(el, addBtn || null);
+          if (this.updateTabScrollArrows) this.updateTabScrollArrows();
+          return;
+        }
+        if (existing.length === n + 1 && typeof removedIndex === 'number' && n >= 2) {
+          // 关闭一个：移除该元素并顺移后续 data-index。
+          // ⚠ existing[removedIndex] 就是**被移除的元素本身**：必须从 removedIndex+1 开始、
+          // 新索引 = i-1。旧写法从 removedIndex 开始赋 i 值，第一个改到的是已分离的死元素、
+          // 后续元素索引整体 +1 → 关闭后点击标签切到右边那个、首个标签永远点不到
+          //（用户实测：关掉 Untitled1 后整排标签点击全部错位，2026-09-25）。
+          const el = existing[removedIndex];
+          if (el) el.remove();
+          for (let i = removedIndex + 1; i < existing.length; i++) {
+            if (existing[i]) existing[i].dataset.index = String(i - 1);
+          }
+          // 关闭会改变后续标签位置：激活高亮/修改标记按新位置刷新（原路径不更新 class，
+          // 残留的 active 会贴在错误元素上）。
+          this.updateTabDisplay();
+          if (this.updateTabScrollArrows) this.updateTabScrollArrows();
+          return;
+        }
+        // 兜底
+        this._renderTabBarFull();
+      },
+      // 每键入都会调用（cm.on('change') → updateTabDisplay）：原实现无条件对**每个** tab 写
+      // className（必然触发样式重算）与名字，哪怕只有一个脏标记变了。改为值相同不写，
+      // 多标签文档下每键省掉 N 次无意义的 DOM 写入与样式失效（2026-09-26）。
+      updateTabDisplay() {
+        const tabs = document.querySelectorAll('.tab');
+        tabs.forEach((tab, i) => {
+          if (i >= this.tabs.length) return;
+          const cls = `tab${i === this.activeTabIndex ? ' active' : ''}${this.tabs[i].isModified ? ' modified' : ''}${this.tabs[i].pendingExternalChange ? ' external-change' : ''}`;
+          if (tab.className !== cls) tab.className = cls;
+          const name = this.tabs[i].name;
+          const nameEl = tab.querySelector('.tab-name');
+          if (nameEl && nameEl.textContent !== name) nameEl.textContent = name;
+        });
+      },
+      async closeOtherTabs(keepIndex) {
+        if (keepIndex < 0 || keepIndex >= this.tabs.length) return;
+        const otherModified = this.tabs.filter((t, i) => i !== keepIndex && t.isModified);
+        if (otherModified.length > 0) {
+          const result = await this.showSaveDialog(
+            this.t('saveChanges'),
+            this.t('filesModifiedConfirm', { n: otherModified.length }),
+            this.t('saveAll'), this.t('discardAll'), this.t('cancel')
+          );
+          if (result === 'cancel') return;
+          if (result === 'save') {
+            const ok = await this.batchSaveTabs(otherModified);
+            if (!ok) return;
+          } else {
+            for (const tab of otherModified) {
+              tab.content = tab.savedContent;
+            }
+            this.cm.setValue(this.activeTab.content);
+            this.updateTabDisplay();
+            this.updatePreview();
+          }
+        }
+        const tab = this.tabs[keepIndex];
+        this.tabs = [tab];
+        this.activeTabIndex = 0;
+        this._editorTab = tab; // 其余标签已移除，编辑器承载的就是保留的这个
+        await this.ensureTabLoaded(tab);
+        this.cm.setValue(tab.content || '');
+        this._syncEditorModeFor(tab);
+        this.cm.setCursor(tab.cursorPos || { line: 0, ch: 0 });
+        this.updateTabBar();
+        this.updatePreview();
+        this.saveSession();
+      },
+      async closeAllTabs() {
+        const modified = this.tabs.filter(t => t.isModified);
+        if (modified.length > 0) {
+          const result = await this.showSaveDialog(
+            this.t('saveChanges'),
+            this.t('filesModifiedConfirm', { n: modified.length }),
+            this.t('saveAll'), this.t('discardAll'), this.t('cancel')
+          );
+          if (result === 'cancel') return;
+          if (result === 'save') {
+            const ok = await this.batchSaveTabs(modified);
+            if (!ok) return;
+          }
+        }
+        this.tabs = [new Tab(`${this.t('untitled')}${this.untitledCounter++}`)];
+        this.activeTabIndex = 0;
+        this._editorTab = this.tabs[0]; // 全部替换为新空标签，编辑器承载它
+        this.cm.setValue('');
+        this._syncEditorModeFor(this.tabs[0]);
+        this.updateTabBar();
+        this.updatePreview();
+        this.saveSession();
+      },
+    // 标签页拖拽排序（指针事件，规避 Tauri 原生 DnD 接管）
+    initTabDragEvents() {
+      // 标签页拖拽排序：用指针事件实现，避免 Tauri 默认开启 dragDropEnabled 接管原生 DnD 导致拖不动
+      document.addEventListener('mousemove', (e) => {
+        const ds = this._dragState;
+        if (!ds) return;
+        if (!ds.active) {
+          const dx = e.clientX - ds.startX;
+          const dy = e.clientY - ds.startY;
+          if (Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+          ds.active = true;
+          this._startTabDrag(ds.from);
+        }
+        this._updateTabDragTarget(e.clientX, e.clientY);
+      });
+      document.addEventListener('mouseup', (e) => {
+        const ds = this._dragState;
+        if (!ds) return;
+        if (ds.active) {
+          const to = this._tabIndexAtPoint(e.clientX, e.clientY);
+          if (to != null && to !== ds.from) this.reorderTab(ds.from, to);
+          this._endTabDrag();
+          this._suppressClick = true;
+        }
+        this._dragState = null;
+      });
+    },
+    // 最近文件 / 最近工作区子菜单交互
+    initRecentMenus() {
+      // 最近文件子菜单交互
+      document.getElementById('btn-recent').addEventListener('mouseenter', () => {
+        this.showRecentSubmenu();
+      });
+      document.getElementById('btn-recent').addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.showRecentSubmenu();
+      });
+      document.getElementById('file-menu').addEventListener('mouseover', (e) => {
+        if (e.target.closest('#recent-files-submenu')) return;
+        if (e.target.closest('#btn-recent')) return;
+        if (e.target.closest('#recent-workspaces-submenu')) return;
+        if (e.target.closest('#btn-recent-workspaces')) return;
+        this.hideRecentSubmenu();
+        this.hideRecentWorkspacesSubmenu();
+      });
+      const recentSubmenu = document.getElementById('recent-files-submenu');
+      recentSubmenu.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const clearItem = e.target.closest('[data-action="clear"]');
+        if (clearItem) {
+          this.clearRecentFiles();
+          this.hideRecentSubmenu();
+          return;
+        }
+        const item = e.target.closest('.recent-file-item');
+        if (item && item.dataset.path) {
+          const path = item.dataset.path;
+          document.getElementById('file-menu').classList.add('hidden');
+          this.hideRecentSubmenu();
+          this.openFilePath(path);
+        }
+      });
+      // 最近工作区子菜单交互
+      const wsTrigger = document.getElementById('btn-recent-workspaces');
+      if (wsTrigger) {
+        wsTrigger.addEventListener('mouseenter', () => this.showRecentWorkspacesSubmenu());
+        wsTrigger.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.showRecentWorkspacesSubmenu();
+        });
+      }
+      const wsSubmenu = document.getElementById('recent-workspaces-submenu');
+      if (wsSubmenu) {
+        wsSubmenu.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const clearItem = e.target.closest('[data-action="clear"]');
+          if (clearItem) {
+            this.clearRecentWorkspaces();
+            this.hideRecentWorkspacesSubmenu();
+            return;
+          }
+          const item = e.target.closest('.recent-workspace-item');
+          if (item && item.dataset.path) {
+            const path = item.dataset.path;
+            document.getElementById('file-menu').classList.add('hidden');
+            this.hideRecentWorkspacesSubmenu();
+            this.maybeOpenFolderPath(path, { confirm: true });
+          }
+        });
+      }
+    },
+  };
+
+  const api = { mixin };
+  window.TMTabs = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})();

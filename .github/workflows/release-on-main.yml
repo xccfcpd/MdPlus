@@ -1,0 +1,220 @@
+name: Release on main
+
+# 推送 main 即自动发布（CI 自动创建 tag + GitHub Release）。
+#
+# 语义：
+#   - push main：读 package.json 的 version，tag v<version> 不存在 → 构建并发布；
+#     tag 已存在（版本没提升）→ 只跑 gate，不构建不发布，避免重复发版。
+#   - workflow_dispatch：force=true 覆盖重发；draft=true 建草稿（需人工 Publish）。
+#
+# 发布说明：scripts/release-notes.js（中文全文），下载链接已直接指向本仓库的 GitHub Release 地址。
+# 本 fork 已彻底停用自动更新（相关依赖/权限/配置均已移除），故无需签名私钥，
+#           也不上传 update-windows-x86_64.json。
+# 与 build-windows.yml 共存：那个负责 tag 手动发版与分支临时出包（都响应 main 推送，
+#           想省 CI 额度可把 main 从它的 branches 列表移除）。
+# 需仓库 Settings → Actions → General → Workflow permissions = Read and write，否则 403。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '即使 v<version> 已发布过也重新构建并覆盖发布'
+        type: boolean
+        default: false
+      draft:
+        description: '以 draft（草稿）创建 Release，需人工点 Publish'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-main
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. 版本闸门：决定本次是否发版（控制后续 job 是否执行） ──
+  gate:
+    name: Version gate
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+      version: ${{ steps.gate.outputs.version }}
+      draft: ${{ steps.gate.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 判断 tag 是否存在 + 给 release-notes 归纳提交历史，都需要全历史
+          fetch-depth: 0
+
+      - name: Setup Node 22 (LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Decide whether to release
+        id: gate
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE_INPUT: ${{ inputs.force }}
+          DRAFT_INPUT: ${{ inputs.draft }}
+        run: |
+          set -euo pipefail
+          node scripts/check-version.mjs
+          VERSION="$(node -p "require('./package.json').version")"
+          FORCE=false
+          DRAFT=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$FORCE_INPUT" = "true" ]; then FORCE=true; fi
+            if [ "$DRAFT_INPUT" = "true" ]; then DRAFT=true; fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::force=true → 无论 v$VERSION 是否已发布都重新构建并覆盖"
+          elif git tag --list "v$VERSION" | grep -q .; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION 已发布过 → 跳过。再次发版请先提升 package.json 版本号，或 dispatch + force"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$VERSION 尚未发布 → 开始构建并发布"
+          fi
+
+  # ── 2. 构建 Windows 三种安装包（仅需发版时执行） ──
+  build:
+    name: Build Windows x64
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Node 22 (LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (npm ci, full)
+        run: npm ci
+
+      - name: Install Rust (stable, msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-release-${{ github.repository }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-${{ github.repository }}-
+
+      # npm run build = build:renderer + tauri build；结束后 postbuild 输出
+      # TizuMark_<version>_x64.exe（绿色版）。产物未做代码签名，属预期。
+      - name: Build (tauri build)
+        run: npm run build
+
+      - name: Collect installers
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $map = [ordered]@{
+            "src-tauri/target/release/bundle/nsis/TizuMark_${env:VERSION}_x64-setup.exe" = "release/TizuMark_${env:VERSION}_x64-setup.exe"
+            "src-tauri/target/release/bundle/msi/TizuMark_${env:VERSION}_x64_en-US.msi"  = "release/TizuMark_${env:VERSION}_x64_en-US.msi"
+            "src-tauri/target/release/TizuMark_${env:VERSION}_x64.exe"                   = "release/TizuMark_${env:VERSION}_x64.exe"
+          }
+          foreach ($k in $map.Keys) {
+            if (-not (Test-Path $k)) {
+              Write-Host '实际产物：'
+              Get-ChildItem -Recurse 'src-tauri/target/release' -Include *.exe,*.msi -File -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty FullName
+              throw "缺少构建产物: $k"
+            }
+            Copy-Item $k $map[$k] -Force
+            Write-Host ("collected {0} ({1:N2} MB)" -f $map[$k], ((Get-Item $map[$k]).Length / 1MB))
+          }
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          if-no-files-found: error
+          retention-days: 7
+          path: release/*
+
+  # ── 3. 生成发布说明并创建/更新 Release ──
+  release:
+    name: Publish release
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 22 (LTS)
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Download installers
+        uses: actions/download-artifact@v5
+        with:
+          name: release-assets
+          path: release
+
+      - name: Generate bilingual release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/release-notes.js
+          NOTES="release/RELEASE_NOTES_v${VERSION}.md"
+          test -f "$NOTES"
+          # 归一化发布说明里的下载链接到当前仓库的 GitHub Release 地址
+          # （release-notes.js 已直接产出 xccfcpd/mdplus 地址，这里是兜底：任何仓库路径都改写为当前仓库）
+          sed -E -i "s#https://github\.com/[^/]+/[^/]+/releases/download/v[0-9.]*/#https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/#g" "$NOTES"
+          echo '--- notes head ---'
+          head -n 12 "$NOTES"
+
+      - name: Create or update Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          DRAFT: ${{ needs.gate.outputs.draft }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          NOTES="release/RELEASE_NOTES_v${VERSION}.md"
+          ASSETS=("release/TizuMark_${VERSION}_x64-setup.exe"
+                  "release/TizuMark_${VERSION}_x64_en-US.msi"
+                  "release/TizuMark_${VERSION}_x64.exe")
+          for f in "${ASSETS[@]}"; do
+            if [ ! -f "$f" ]; then echo "::error::缺少安装产物 $f"; exit 1; fi
+          done
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在 → 覆盖附件与发布说明"
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            gh release edit "$TAG" --notes-file "$NOTES" --title "TizuMark $TAG" --draft="$DRAFT"
+          else
+            echo "Release $TAG 不存在 → 新建（tag 指向 $GITHUB_SHA）"
+            gh release create "$TAG" "${ASSETS[@]}" --target "$GITHUB_SHA" \
+              --title "TizuMark $TAG" --notes-file "$NOTES" --draft="$DRAFT"
+          fi
+          gh release view "$TAG" --json tagName,isDraft,assets \
+            --jq '.tagName, .isDraft, (.assets[] | "  asset: \(.name) \(.size) bytes")'

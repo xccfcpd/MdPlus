@@ -1,0 +1,2471 @@
+// ============================================================
+// diagram-converters —— 图表「语言转换器 + 原生 SVG 渲染器」纯函数模块
+// ------------------------------------------------------------
+// 职责边界（与 diagram-renderers.js 分工）：
+//   本模块 = 纯函数，不碰 DOM、不读全局引擎、不联网。输入源码字符串，输出
+//             Mermaid 图描述（交给既有 processMermaid 渲染）或 SVG 字符串。
+//   diagram-renderers.js = 容器编排与引擎适配（含 ECharts/WaveDrom/Graphviz/TikZ/plot/Markmap）。
+// 这样拆分的收益：转换逻辑可零依赖单测（test/diagrams.test.cjs 直接 require）。
+//
+// 支持的围栏语言：
+//   ```plantuml / ```uml / ```puml / ```pu   PlantUML 子集 → Mermaid
+//   ```d2                                    D2 子集 → Mermaid
+//   ```tikz                                  TikZ 子集 → 原生 SVG
+//   ```plot / ```gnuplot                     gnuplot 风格函数绘图 → 原生 SVG
+//
+// 为什么 PlantUML / D2 转 Mermaid 而不是自研布局：这两者的真正难点是自动布局，
+// 自研成本高、质量不可控；降级为等价 Mermaid 图描述后复用已分发的 mermaid.min.js，
+// 得到纯本地、可离线、零体积增量的渲染。语法子集之外的内容由调用方保留原代码块
+// 并提示，绝不静默丢弃。
+//
+// 为什么 TikZ / plot 自研 SVG：无等价替代（Graphviz 只认 DOT，Mermaid 无 TikZ 语法）。
+// 表达式解析器为自研递归下降，**不使用 eval / new Function**（预览内容来自用户文档，
+// 任何代码求值都是 XSS 面）。
+//
+// 整文件包 IIFE：经典 <script> 的顶层 const/function 会进入全局词法环境且跨脚本共享，
+// 与其它脚本同名即 SyntaxError。用函数作用域隔离，仅经 window.DiagramConverters 暴露。
+// ============================================================
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * 0. 通用工具
+   * ============================================================ */
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#x27;');
+  }
+
+  // Mermaid 双引号标签：内部 " 必须转义，换行转 <br/>
+  function mq(s) {
+    return '"' + String(s == null ? '' : s)
+      .replace(/"/g, '#quot;')
+      .replace(/\r?\n/g, '<br/>') + '"';
+  }
+
+  // Mermaid 边标签 |>| 包裹：| 会截断标签
+  function mpipe(s) {
+    return String(s == null ? '' : s)
+      .replace(/\|/g, '&#124;')
+      .replace(/\r?\n/g, ' ');
+  }
+
+  // Mermaid 节点 id 归一化：仅保留 [A-Za-z0-9_]，数字开头加前缀
+  function mid(raw, fallback) {
+    let s = String(raw == null ? '' : raw).trim().replace(/[^\w]/g, '_').replace(/^_+|_+$/g, '');
+    if (!s) s = fallback || 'n';
+    if (/^\d/.test(s)) s = 'n_' + s;
+    return s;
+  }
+
+  // 名称 → Mermaid id 的**唯一**映射（每次转换新建一个）。
+  // 为什么需要：mid() 只保留 [A-Za-z0-9_]，中文 / 日文 / 含空格的名字会被清成空串，
+  // 于是所有这类名字都拿到**同一个** fallback。历史 bug（2026-09-24 由验证文档暴露）：
+  //   · 5 个中文类名全变成 `C` → 类图塌成一个类并自相连；
+  //   · `participant "认证服务" as Auth` 变成 `participant P as Auth`（图上多出一个 P）；
+  //   · D2 的中文节点全变成 `N` → 整张图变成自环。
+  // 规则：ASCII 名字沿用 mid() 的结果（既有文档 id 不变），非 ASCII 名按出现顺序分配
+  // 稳定序号（n1、n2…），并用 used 集合保证不同名字一定得到不同 id。
+  function makeIdAllocator() {
+    const byName = new Map();
+    const used = new Set();
+    let n = 0;
+    return function idOf(raw, fallback) {
+      const key = String(raw == null ? '' : raw).trim();
+      if (!key) {
+        // 空名（退化行，如 `"" --> ""`）同样要去重：否则两个空名会拿到同一个 id 互相覆盖，
+        // 非空名有唯一性保证而空名没有 —— 审计发现的最后一处不闭合。
+        let eid = (fallback || 'n') + (++n);
+        while (used.has(eid)) eid = (fallback || 'n') + (++n);
+        used.add(eid);
+        return eid;
+      }
+      if (byName.has(key)) return byName.get(key);
+      // 注意：不能写 mid(key, '')—— mid 的 `fallback || 'n'` 会把空串变成 'n'，
+      // 于是第一个中文名拿到 'n'、其余拿到 C1/C2…，编号风格不一致。这里显式判空。
+      let id = key.replace(/[^\w]/g, '_').replace(/^_+|_+$/g, '');
+      if (id && /^\d/.test(id)) id = 'n_' + id;
+      if (!id) id = (fallback || 'n') + (++n);
+      while (used.has(id)) id = (fallback || 'n') + (++n);
+      used.add(id);
+      byName.set(key, id);
+      return id;
+    };
+  }
+
+  // 从 openIdx（指向 open 字符）找到配对的 close 下标；考虑引号与转义
+  function matchBracket(text, openIdx, open, close) {
+    let depth = 0;
+    let q = false;
+    for (let i = openIdx; i < text.length; i++) {
+      const c = text[i];
+      if (q) {
+        if (c === '\\') { i++; continue; }
+        if (c === '"') q = false;
+        continue;
+      }
+      if (c === '"') { q = true; continue; }
+      if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return -1;
+  }
+
+  function stripQuotes(s) {
+    const t = String(s == null ? '' : s).trim();
+    if (t.length >= 2 && t[0] === '"' && t[t.length - 1] === '"') return t.slice(1, -1);
+    return t;
+  }
+
+  // 顶层分隔（忽略引号 / 括号 / 方括号内部）
+  function splitTopLevel(s, sepChar) {
+    const out = [];
+    let cur = '';
+    let depth = 0;
+    let q = false;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (q) {
+        cur += c;
+        if (c === '\\') { if (i + 1 < s.length) cur += s[++i]; continue; }
+        if (c === '"') q = false;
+        continue;
+      }
+      if (c === '"') { q = true; cur += c; continue; }
+      if (c === '(' || c === '[' || c === '{') depth++;
+      if (c === ')' || c === ']' || c === '}') depth--;
+      if (c === sepChar && depth <= 0) { out.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    out.push(cur);
+    return out;
+  }
+
+  // 行注释 / 块注释剥离器（保留字符串字面量）
+  function stripComments(text, opts) {
+    const o = opts || {};
+    const lineTokens = o.line || [];
+    const hashAtLineStart = !!o.hashLine;
+    let out = '';
+    let i = 0;
+    let q = false;
+    while (i < text.length) {
+      const c = text[i];
+      if (q) {
+        out += c;
+        if (c === '\\' && i + 1 < text.length) { out += text[++i]; i++; continue; }
+        if (c === '"') q = false;
+        i++;
+        continue;
+      }
+      if (c === '"') { q = true; out += c; i++; continue; }
+      if (c === '/' && text[i + 1] === '*') {
+        i += 2;
+        while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++;
+        i += 2;
+        continue;
+      }
+      if (lineTokens.some((t) => text.startsWith(t, i))) {
+        while (i < text.length && text[i] !== '\n') i++;
+        continue;
+      }
+      if (hashAtLineStart && c === '#' && (i === 0 || text[i - 1] === '\n')) {
+        while (i < text.length && text[i] !== '\n') i++;
+        continue;
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  }
+
+  function indent(n) {
+    return new Array(n + 1).join('  ');
+  }
+
+  /* ============================================================
+   * 2. PlantUML → Mermaid
+   * ------------------------------------------------------------
+   * 覆盖：类图 / 时序图 / 活动图 / 状态图 / 思维导图 / 组件与用例图 / 甘特图。
+   * 判定顺序即下方 plantumlKind 的分支顺序（先特征更明确的图种）。
+   * 不覆盖：JSON/YAML 视图、salt、时序图的 create/destroy 精确语义、
+   *         活动图的 fork/split 并发分支（超出时返回 null 保留代码块并提示）。
+   * ============================================================ */
+
+  function stripPlantumlDecorations(src) {
+    let text = String(src == null ? '' : src);
+    // 块注释 /' ... '/
+    text = text.replace(/\/'[\s\S]*?'\//g, '');
+    // 整行行注释（' 开头，但要排除地址中的撇号：仅当行首非空白后紧跟 ' 时）
+    text = text.split('\n').filter((l) => !/^\s*'/.test(l)).join('\n');
+    return text;
+  }
+
+  // 关系记号归一化：去掉 up/down/left/right 方向词，补齐虚线/实线
+  function normalizePumlArrow(a) {
+    let x = String(a || '').replace(/(?:up|down|left|right)/gi, '');
+    if (/^<\|-+$/.test(x)) return '<|--';
+    if (/^<\|\.+$/.test(x)) return '<|..';
+    if (/\|>$/.test(x)) return '..|>';
+    if (/\*/.test(x)) return '*--';
+    if (/^o/.test(x)) return 'o--';
+    if (/^<-+$/.test(x)) return '<--';
+    if (/^\.+>$/.test(x)) return '..>';
+    if (/^\.+$/.test(x)) return '..';
+    if (/^-+>?$/.test(x)) return x.indexOf('>') !== -1 ? '-->' : '--';
+    if (/\./.test(x)) return '..>';
+    return x;
+  }
+
+  // PlantUML 成员 → Mermaid 类成员
+  function pumlMember(raw) {
+    let s = String(raw || '').trim();
+    if (!s) return '';
+    let mod = '';
+    s = s.replace(/\{(\w+)\}/g, (m, k) => {
+      if (/static/i.test(k)) mod += '$';
+      if (/abstract/i.test(k)) mod += '*';
+      return '';
+    }).trim();
+    let vis = '';
+    if (/^[+\-#~]/.test(s)) vis = s[0];
+    if (vis) s = s.slice(1).trim();
+    // 方法：name(args): Ret
+    const mm = s.match(/^([\w$]+)\s*(\([^)]*\))\s*(?::\s*(.*))?$/);
+    if (mm) {
+      const ret = (mm[3] || 'void').trim();
+      return vis + ret + ' ' + mm[1] + mm[2] + mod;
+    }
+    // 字段：name: Type
+    const fm = s.match(/^([\w$]+)\s*:\s*(.+)$/);
+    if (fm) return vis + fm[2].trim() + ' ' + fm[1] + mod;
+    return vis + s + mod;
+  }
+
+  function plantumlKind(text) {
+    if (/@startmindmap|@startwbs/i.test(text)) return 'mindmap';
+    if (/@startgantt/i.test(text)) return 'gantt';
+    // 明确不属于图种的非渲染视图：直接判为 unsupported（toMermaid 的 default 分支 → null），
+    // 免得它们落到后面某个图种分支里"被猜着转换"，产出看似成功却错误的结果。
+    if (/@start(?:json|yaml|salt)\b/i.test(text)) return 'unsupported';
+
+    // 状态图优先于时序图：`Idle --> Running : ev` 与时序图 `A -> B : msg` 形态相近，
+    // 但状态图必带 [*] 起止或 state 关键字，故先用它们消歧（否则状态图会被误判为时序图）。
+    // 注意 `state\s+[^\s{]`（而不是旧的 `["\w]`）：旧写法不认 `state 空闲 as Idle` 这类
+    // 中文状态名，于是整张状态图会被后面的 `--+>` 分支判成类图（审计发现）。
+    if (/^\s*\[\*\]\s*-+>/m.test(text) || /^\s*state\s+[^\s{]/mi.test(text)) return 'state';
+
+    // 活动图：start/stop 独立成行、:动作; 语句、if(...) / while(...)
+    if (/^\s*(start|stop)\s*$/mi.test(text) || /^\s*:[^;\n]+;\s*$/m.test(text) ||
+        /^\s*(if|while)\s*\(/mi.test(text)) return 'activity';
+
+    // 类图：显式关键字或类图专有关系符
+    if (/\bclass\s+[\w"<]|\binterface\s+[\w"<]|\benum\s+[\w"<]|\babstract\s+class\b|<\|--|<\|\.\.|\*--|o--|\.\.>|\.\.\|>/.test(text)) return 'class';
+
+    // 用例图 / 组件图的**特征标记要先于时序图判定**：`actor` / `database` 这类声明在时序图里
+    // 同样合法（两者共用语法），若先判时序图，那么"含 actor 的用例图"会被整张判成时序图，
+    // 渲染出一张类型完全不同的图（2026-09-24 由渲染验证文档暴露）。
+    // 这里只挑**时序图不会出现**的标记消歧：
+    //   · usecase / component 关键字
+    //   · 行首 `[X]` 声明（时序图的外部消息 `[-> A : msg` 没有配对的 `]`，不会误命中）
+    //   · 行首 `(X)` 声明
+    if (/^\s*usecase\s+/mi.test(text) || /^\s*component\s+/mi.test(text) ||
+        /^\s*\[[^\]]+\]/m.test(text)) return 'component';
+    if (/^\s*\(\s*[^)]+\s*\)/m.test(text)) return 'usecase';
+    // 容器声明单独出现时也是组件图（`database 缓存` + `folder 源码` 曾被判成时序图）。
+    // 消歧依据：**单短横线消息箭头 `A -> B` 只有时序图会用**（状态/类图都用双短横 `-->`），
+    // 所以出现单短横箭头时不抢判。
+    const oneDashArrow = /^\s*("[^"]+"|[^\s:<>=\-\\/]+)\s*->\s*("[^"]+"|[^\s:<>=\-\\/]+)/m.test(text);
+    // 关键字后的名字用 `[^\s{]` 而不是旧的 `["\w]`：后者不认中文名
+    //（`database 缓存` 匹配不到 → 兜到 seqDecl 被误判成时序图，审计发现）
+    if (!oneDashArrow &&
+        /^\s*(package|node|folder|frame|cloud|database)\s+[^\s{]/mi.test(text)) return 'component';
+
+    // 时序图
+    const seqDecl = /^\s*(participant|actor|boundary|control|entity|database|collections|queue)\s+/mi.test(text);
+    // 带消息文本：A -> B : msg
+    // 名字 token 允许**非 ASCII**（中文等）：旧版只认 [\w.$]，于是 `用户 -> 系统: 登录`
+    // 这类中文时序图匹配不到，落到最后的 `--+>` 分支被误判成类图（图上出现一个叫
+    // autonumber 的类之类）。类图专有关系符已在上一行先行判定，这里放宽不会抢走类图。
+    const seqMsg = /^\s*("[^"]+"|[^\s:<>=\-\\/]+)\s*(?:<?-{1,2}(?:>>?|x|\\|\/|o)?|o-{1,2}>?)\s*("[^"]+"|[^\s:<>=\-\\/]+)\s*:/m.test(text);
+    // 无消息文本：A -> B（**单短横线**才是时序箭头；类图关联用双短横线 -->，
+    // 故这里刻意只认单短横线，避免把类图关联误判成时序图）
+    const seqArrow = /^\s*("[^"]+"|[^\s:<>=\-\\/]+)\s*->{1,2}\s*("[^"]+"|[^\s:<>=\-\\/]+)\s*$/m.test(text);
+    if (seqDecl || seqMsg || seqArrow) return 'sequence';
+
+    if (/^\s*\(\s*[^)]+\s*\)/m.test(text)) return 'usecase';
+    if (/^\s*\[[^\]]+\]/m.test(text) || /^\s*component\s+/mi.test(text) ||
+        /^\s*(package|node|folder|frame|cloud|database)\s+[^\s{]/mi.test(text)) return 'component';
+
+    // 只剩 --> 关系、无关键字：按类图处理（最常见）
+    if (/--+>|\.\.>/.test(text)) return 'class';
+    return 'unsupported';
+  }
+
+  function plantumlClassToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['classDiagram'];
+    const declared = new Set();
+    const aliasOf = new Map();
+    const idOf = makeIdAllocator();   // 中文类名不再塌成同一个 id
+    const SKIP = /^(@(start|end)|skinparam\b|hide\b|show\b|scale\b|header\b|footer\b|legend\b|caption\b|title\b|note\b|namespace\b|together\b|allowmixing|allow_mixing|left to right direction|top to bottom direction|package\b|set\b|!|remove\b|delete\b)/i;
+    // `legend … endlegend` 是图例块：旧实现只跳过起始行，块内单词行会被当成**裸类名**输出
+    // （图上多出 Legend / endlegend 两个幽灵类；审计发现，2026-09-24）
+    let legendBlock = false;
+    const REL = /^(.+?)\s+([-.<>|o*]{2,}?)\s+(.+)$/;
+
+    let i = 0;
+    while (i < lines.length) {
+      const l = lines[i].trim();
+      i++;
+      if (!l) continue;
+      // 图例块整体跳过（见上方 legendBlock 说明）。必须**先于** SKIP 判定：SKIP 里含 `legend\b`
+      // 会把起始行直接吞掉，块内的裸词行则会被当成类名（`endlegend` 尤其明显）。
+      if (legendBlock) { if (/^end\s*legend$/i.test(l)) legendBlock = false; continue; }
+      if (/^legend\b/i.test(l)) { legendBlock = true; continue; }
+      if (SKIP.test(l)) continue;
+
+      // class / interface / enum / abstract class 定义（可带 as 别名与 { } 主体）
+      const cm = l.match(/^(abstract\s+class|abstract|class|interface|enum|annotation|struct|protocol|entity|circle|diamond)\s+("?[^"{\s]+"?)\s*(?:as\s+(\w+))?\s*(\{)?\s*$/i);
+      if (cm) {
+        const kw = cm[1].toLowerCase().replace(/\s+/g, ' ');
+        const name = stripQuotes(cm[2]);
+        const id = idOf(cm[3] || name, 'C');
+        aliasOf.set(name, id);
+        const stere = kw === 'interface' ? 'interface'
+          : (kw === 'enum' || kw === 'annotation' ? 'enumeration'
+            : (kw === 'abstract' || kw === 'abstract class' ? 'abstract' : ''));
+        const body = [];
+        if (cm[4]) {
+          let depth = 1;
+          while (i < lines.length && depth > 0) {
+            const bl = lines[i].trim();
+            i++;
+            if (/\{$/.test(bl)) depth++;
+            if (/^\}/.test(bl)) { depth--; if (depth === 0) break; }
+            if (bl && !/^(--|\.\.|__|==)\s*$/.test(bl)) body.push(bl);
+          }
+        }
+        out.push('    class ' + id + ' {');
+        if (stere) out.push('        <<' + stere + '>>');
+        for (const b of body) {
+          const mem = pumlMember(b);
+          if (mem) out.push('        ' + mem);
+        }
+        out.push('    }');
+        if (name !== id) out.push('    class ' + id + '["' + name.replace(/"/g, '#quot;') + '"]');
+        declared.add(id);
+        continue;
+      }
+
+      // 关系
+      const rm = l.match(REL);
+      if (rm) {
+        const left = rm[1].trim();
+        const arrow = normalizePumlArrow(rm[2]);
+        let right = rm[3].trim();
+        let label = '';
+        const colon = right.match(/^(.*?)\s*:\s*(.+)$/);
+        if (colon) { right = colon[1].trim(); label = colon[2].trim(); }
+        // 拆基数：PlantUML 两侧写法不同 —— 左侧是「类名在前」(`用户 "1"`)，右侧是「基数在前」
+        // (`"*" 订单`)。历史实现只认后者 → 左侧的 `用户 "1"` 被整串当成类名（生成一个无意义 id，
+        // 类名与基数一起丢失）：用户文档 15.3 类图的 `用户 "1" --> "*" 订单 : 下单` 就是这么坏掉的。
+        const parseSide = (s) => {
+          const m2 = s.match(/^"([^"]*)"\s*(.+)$/);
+          if (m2) return { card: m2[1], name: m2[2].trim() };
+          const m3 = s.match(/^(.+?)\s+"([^"]*)"$/);
+          if (m3) return { card: m3[2], name: m3[1].trim() };
+          return { card: '', name: s };
+        };
+        const ls = parseSide(left);
+        const rs = parseSide(right);
+        if (!ls.name || !rs.name) continue;
+        // 先查别名表：`class 用户 as User` 之后再写 `用户 --> 订单` 时必须命中同一个 id，
+        // 否则图上会出现两个"用户"（审计发现，2026-09-24）
+        const lid = aliasOf.get(ls.name) || idOf(ls.name, 'C');
+        const rid = aliasOf.get(rs.name) || idOf(rs.name, 'C');
+        aliasOf.set(ls.name, lid);
+        aliasOf.set(rs.name, rid);
+        const cardL = ls.card ? '"' + ls.card + '" ' : '';
+        const cardR = rs.card ? ' "' + rs.card + '"' : '';
+        out.push('    ' + lid + ' ' + cardL + arrow + cardR + ' ' + rid + (label ? ' : ' + label : ''));
+        continue;
+      }
+
+      // 裸类名声明（无关键字、无关系）：同样先查别名表
+      if (/^[\w."<>]+$/.test(l)) {
+        const rawName = stripQuotes(l);
+        const id = aliasOf.get(rawName) || idOf(rawName, 'C');
+        if (!declared.has(id)) { out.push('    class ' + id); declared.add(id); }
+      }
+    }
+    void aliasOf;
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  // PlantUML 时序箭头 → Mermaid 时序箭头
+  function pumlSeqArrow(a) {
+    const s = String(a || '');
+    const dashed = /^--|^\.\./.test(s);
+    const base = dashed ? '--' : '-';
+    return base + (/x/.test(s) ? 'x' : '>>');
+  }
+
+  function plantumlSequenceToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['sequenceDiagram'];
+    const declared = new Set();
+    const idOf = makeIdAllocator();
+    let blockDepth = 0;   // alt/opt/loop/par/… 未闭合的层数（`end` 必须与它配对输出）
+    const blockStack = []; // 各层块的类型：par 的分支分隔符在 Mermaid 里是 and 而不是 else
+    // 名字 token 允许非 ASCII（中文参与者/角色名很常见）；箭头前后不留空格也要认
+    const MSG = /^("[^"]*"|[^\s:<>=\-\\/]+)\s*([<>ox\\\/]*[-=.]+[<>ox\\\/]*)\s*("[^"]*"|[^\s:<>=\-\\/]+)\s*(?::\s*([\s\S]*))?$/;
+    const SKIP = /^(@(start|end)|skinparam\b|hide\b|show\b|scale\b|header\b|footer\b|legend\b|caption\b|newpage\b|autoactivate\b|ref\s+over\b|group\b|end\s+group\b|\.\.\.\s*$|==+.*==+\s*$|--+\s*$)/i;
+
+    // 显示名/别名 → id：`participant "认证服务" as Auth` 之后再按 `认证服务` 或 `Auth` 发消息，
+    // 都必须命中同一个参与者（否则图上出现两个同名参与者；审计发现，2026-09-24）
+    const nameToId = new Map();
+    const declare = (raw) => {
+      const name = stripQuotes(String(raw || '').trim());
+      if (nameToId.has(name)) return nameToId.get(name);
+      const id = idOf(name, 'P');
+      nameToId.set(name, id);
+      if (!declared.has(id)) {
+        declared.add(id);
+        // 名字被归一化（中文等）时补一个显示名，避免图上出现 n1 / P 这种占位
+        if (id !== name) out.push('    participant ' + id + ' as ' + name.replace(/\s+/g, ' '));
+      }
+      return id;
+    };
+
+    let i = 0;
+    let noteBlock = null;
+    let lastFrom = null;   // 上一条消息的发起/接收方：供 `return` 反向成回复箭头
+    let lastTo = null;
+    while (i < lines.length) {
+      const l = lines[i].trim();
+      i++;
+      if (!l) continue;
+
+      if (noteBlock) {
+        if (/^end\s*note$/i.test(l)) {
+          out.push('    ' + noteBlock.header + ': ' + noteBlock.lines.join('<br/>'));
+          noteBlock = null;
+        } else {
+          noteBlock.lines.push(l);
+        }
+        continue;
+      }
+      // `return <msg>`：PlantUML 的"返回调用者"。本地不维护调用栈，按**上一条消息反向**
+      // 处理（覆盖绝大多数写法）——比原来整行丢弃更接近原意（审计发现 return 在 SKIP 里）。
+      const retM = l.match(/^return\b\s*([\s\S]*)$/i);
+      if (retM) {
+        const text = (retM[1] || '').trim();
+        if (lastFrom && lastTo) {
+          out.push('    ' + lastTo + '-->>' + lastFrom + (text ? ': ' + text.replace(/\n/g, '<br/>') : ''));
+        }
+        continue;
+      }
+      if (SKIP.test(l)) continue;
+
+      const tm = l.match(/^title\s+(.+)$/i);
+      if (tm) { out.push('    accTitle: ' + tm[1].trim()); continue; }
+      if (/^autonumber\b/i.test(l)) { out.push('    autonumber'); continue; }
+
+      // participant / actor 声明
+      const pm = l.match(/^(participant|actor|boundary|control|entity|database|collections|queue)\s+(\S+)\s*(?:as\s+("[^"]*"|\S+))?\s*$/i);
+      if (pm) {
+        const kind = /^actor$/i.test(pm[1]) ? 'actor' : 'participant';
+        const rawName = stripQuotes(pm[2]);
+        const alias = pm[3] ? stripQuotes(pm[3]) : null;
+        // id 优先取显式别名（写成 ASCII 时最稳），显示名仍用原始名字 ——
+        // 这样 `participant "认证服务" as Auth` 得到 `participant Auth as 认证服务`，
+        // 而不是历史 bug 里的 `participant P as Auth`（图上会多出一个 P）。
+        const id = idOf(alias || rawName, 'P');
+        declared.add(id);
+        nameToId.set(rawName, id);
+        if (alias) nameToId.set(alias, id);
+        const label = alias ? rawName : (id !== rawName ? rawName : null);
+        out.push('    ' + kind + ' ' + id + (label ? ' as ' + label : ''));
+        continue;
+      }
+
+      // 激活 / 销毁
+      const am = l.match(/^(activate|deactivate|destroy)\s+(\S+)/i);
+      if (am) { out.push('    ' + am[1].toLowerCase() + ' ' + declare(am[2])); continue; }
+
+      // 创建参与者：PlantUML 写 `create B`，Mermaid 必须写 `create participant B`。
+      // 以前这一行整行被丢弃 → 生命线凭空出现（图看着正常、语义丢了），而同一族的 `destroy`
+      // 却被原样保留，两者不对称（审计发现，2026-09-25）。
+      const cm = l.match(/^create\s+(?:(participant|actor)\s+)?(\S+)/i);
+      if (cm) {
+        const kw = (cm[1] || 'participant').toLowerCase();
+        out.push('    create ' + kw + ' ' + declare(cm[2]));
+        continue;
+      }
+
+      // box 分组
+      if (/^box\b/i.test(l)) { out.push('    ' + l); continue; }
+      if (/^end\s+box$/i.test(l)) { out.push('    end'); continue; }
+
+      // 控制块：Mermaid 里 `end` 必须与开启的块配对 —— 只在确实开过块时才输出 end。
+      // 历史上裸 `end` 无条件输出，而 PlantUML 的 `group … end`（group 行在 SKIP 里被丢弃）
+      // 会留下**孤立 end** → sequenceDiagram 直接语法报错、整张图报废（审计发现，2026-09-24）。
+      if (/^(alt|opt|loop|par|critical|break|rect)\b/i.test(l)) {
+        blockStack.push((l.trim().match(/^([a-z]+)/i) || [])[1].toLowerCase());
+        out.push('    ' + l.replace(/\s+/g, ' '));
+        blockDepth++;
+        continue;
+      }
+      if (/^(else|and)\b/i.test(l)) {
+        // ⚠ Mermaid 的 `par` 分支必须用 **and** 分隔（PlantUML 里写的是 else）——
+        // 原样透传会让整张 sequenceDiagram 语法报错、整图报废（审计发现，2026-09-25）。
+        // alt / opt / loop 等仍用 else。
+        const top = blockStack.length ? blockStack[blockStack.length - 1] : '';
+        out.push('    ' + l.replace(/\s+/g, ' ').replace(/^(else|and)\b/i, top === 'par' ? 'and' : 'else'));
+        continue;
+      }
+      if (/^end\b/i.test(l)) { if (blockDepth > 0) { out.push('    end'); blockDepth--; blockStack.pop(); } continue; }
+
+      // 注释
+      const nm = l.match(/^note\s+(left of|right of|over)\s+([^:]+?)\s*(?::\s*([\s\S]*))?$/i);
+      if (nm) {
+        const pos = nm[1].toLowerCase();
+        const who = nm[2].split(',').map((x) => declare(x.trim())).join(',');
+        const text = (nm[3] || '').trim();
+        if (text) out.push('    Note ' + pos + ' ' + who + ': ' + text.replace(/\n/g, '<br/>'));
+        else noteBlock = { header: 'Note ' + pos + ' ' + who, lines: [] };
+        continue;
+      }
+
+      // 消息
+      const mm = l.match(MSG);
+      if (mm) {
+        let from = declare(mm[1]);
+        let to = declare(mm[3]);
+        const arrow = mm[2];
+        const text = (mm[4] || '').trim();
+        if (/^</.test(arrow)) { const t = from; from = to; to = t; }
+        const a = pumlSeqArrow(arrow);
+        lastFrom = from;
+        lastTo = to;
+        out.push('    ' + from + a + to + (text ? ': ' + text.replace(/\n/g, '<br/>') : ''));
+        continue;
+      }
+      // 其余（delay / ||| / || 等）忽略
+    }
+    // 源码少写 `end` 时补齐：sequenceDiagram 的未闭合块会直接报错
+    while (blockDepth > 0) { out.push('    end'); blockDepth--; }
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  function plantumlStateToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['stateDiagram-v2'];
+    const SKIP = /^(@(start|end)|skinparam\b|hide\b|show\b|scale\b|header\b|footer\b|legend\b|caption\b|note\b)/i;
+    let noteBlock = false;   // 多行 note 块（`note … end note`）内部行要整体跳过
+    // state 转换器与其他转换器不同：Mermaid 的 stateDiagram **接受 CJK 状态名直接作 id**，
+    // 所以不做「英文 id + 中文 label」映射，而是「ASCII 名走 mid() 归一，非 ASCII 名原样保留」——
+    // 否则 mid('空闲','S') 会把所有中文状态塌成同一个 'S'（幽灵状态，审计发现，2026-09-24）。
+    const sid = (raw) => {
+      const s = stripQuotes(String(raw == null ? '' : raw).trim());
+      // 无空白且无非法字符（含 CJK）→ 原样保留作 id；含空白等（`state "In Progress"`）
+      // 仍交给 mid() 归一，否则会输出 `state In Progress {` 这种非法 Mermaid（审计复核发现）。
+      if (!/^[\w."\-\[\]*\u00A0-\uFFFF]+$/.test(s) || /\s/.test(s)) return mid(s, 'S');
+      return s;
+    };
+    // 输出目标 sink：进入复合状态时切到**子缓冲**，闭合时再决定要不要写花括号。两个原因：
+    //   · 块内出现以该复合状态为端点的转移 → Mermaid 报 "Setting X as parent of X would create
+    //     a cycle"（整张状态图渲染失败）；
+    //   · 块**内容为空**时（上面的转移被缓冲走之后就成空块）→ Mermaid 报 "No such shape:
+    //     roundedWithTitle"（真内核逐形态实测：空块必崩，只要块内有内容就正常）。
+    // 所以：自指边缓冲到所有块之外，空块退化成普通状态声明（`state X`）。
+    let sink = out;
+    const frames = [];        // [{ decl, ids, body }]
+    const deferred = [];
+    const openBlock = (decl, id) => {
+      frames.push({ decl: decl, ids: [id], body: [] });
+      sink = frames[frames.length - 1].body;
+    };
+    const closeBlock = () => {
+      const f = frames.pop();
+      if (!f) return;
+      sink = frames.length ? frames[frames.length - 1].body : out;
+      if (f.body.length) {
+        sink.push('    ' + f.decl + ' {');
+        for (let k = 0; k < f.body.length; k++) sink.push(f.body[k]);
+        sink.push('    }');
+      } else {
+        sink.push('    ' + f.decl);
+      }
+    };
+    // 自指判定要看**全部祖先**复合状态，不只是最内层
+    const openIds = () => {
+      const ids = [];
+      for (let k = 0; k < frames.length; k++) ids.push.apply(ids, frames[k].ids);
+      return ids;
+    };
+    for (const raw of lines) {
+      const l = raw.trim();
+      if (!l || SKIP.test(l)) continue;
+      const tm = l.match(/^title\s+(.+)$/i);
+      if (tm) { sink.push('    accTitle: ' + tm[1].trim()); continue; }
+
+      // 多行 note 块：块内文本与 `end note` 都不是状态语句，必须整体跳过（否则会被当普通状态
+      // 原样透传 → 图上出现空状态与非法 `end note`；审计发现，2026-09-24）
+      if (noteBlock) { if (/^end\s*note$/i.test(l)) noteBlock = false; continue; }
+      if (/^note\b/i.test(l)) { if (!/:\s*\S/.test(l)) noteBlock = true; continue; }
+
+      // `state "X" as Y { … }`：旧正则漏掉行尾的 `{` → 复合状态被压平（`}` 也会被丢弃）
+      const sm = l.match(/^state\s+("[^"]*"|\S+)\s+as\s+(\S+)\s*(\{)?\s*$/i);
+      if (sm) {
+        const id = sid(sm[2]);
+        const decl = 'state ' + mq(stripQuotes(sm[1])) + ' as ' + id;
+        if (sm[3]) openBlock(decl, id); else sink.push('    ' + decl);
+        continue;
+      }
+      const sm2 = l.match(/^state\s+("[^"]*"|\S+)\s*(\{)?\s*$/i);
+      if (sm2) {
+        const id = sid(stripQuotes(sm2[1]));
+        if (sm2[2]) openBlock('state ' + id, id); else sink.push('    state ' + id);
+        continue;
+      }
+      if (/^\}/.test(l)) { closeBlock(); continue; }
+
+      // ⚠ 节点名的字符类必须含 CJK：`[\w…]` 只有 ASCII，`空闲 --> 加热中` 会匹配失败 → 整行
+      // 原样透传，既绕过 sid() 归一，也走不到下面的"块内自指缓冲"（实测：漏改前 `state X { a --> X }`
+      // 仍报 cycle，因为自指那条边压根没被识别成边）。非 ASCII 段与 sid() 的字符类保持一致。
+      const rm = l.match(/^([\w."\-\[\]*\u00A0-\uFFFF]+)\s*-+>\s*([\w."\-\[\]*\u00A0-\uFFFF]+)\s*(?::\s*(.*))?$/);
+      if (rm) {
+        const from = rm[1] === '[*]' ? '[*]' : sid(rm[1]);
+        const to = rm[2] === '[*]' ? '[*]' : sid(rm[2]);
+        const edge = from + ' --> ' + to + (rm[3] ? ' : ' + rm[3] : '');
+        // 端点是任何一个正打开的复合状态 → 推迟到所有块之外输出（见上面 sink 注释）
+        const opens = openIds();
+        if (opens.indexOf(from) >= 0 || opens.indexOf(to) >= 0) deferred.push(edge);
+        else sink.push('    ' + edge);
+        continue;
+      }
+      const dm = l.match(/^([\w."\-\[\]*]+)\s*:\s*(.+)$/);
+      if (dm) { sink.push('    ' + dm[1] + ' : ' + dm[2]); continue; }
+      sink.push('    ' + l);
+    }
+    // 源码少写 `}` 时按现有内容收尾（未闭合的复合块会直接报错）
+    while (frames.length) closeBlock();
+    // 推迟的边在所有块之外统一输出：保留「状态间转移」语义，又不触发自环/空块报错
+    for (const edge of deferred) out.push('    ' + edge);
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  function plantumlActivityToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['flowchart TD'];
+    let seq = 0;
+    const nid = () => 'n' + (++seq);
+    let prevIds = [];
+    let pending = {};
+    const stack = [];
+
+    const newNode = (shape, text) => {
+      const id = nid();
+      if (shape === 'diamond') out.push('    ' + id + '{' + mq(text) + '}');
+      else if (shape === 'circle') out.push('    ' + id + '((' + mq(text) + '))');
+      else if (shape === 'round') out.push('    ' + id + '([' + mq(text) + '])');
+      else out.push('    ' + id + '[' + mq(text) + ']');
+      for (const p of prevIds) {
+        const lbl = pending[p];
+        out.push('    ' + p + ' -->' + (lbl ? '|' + mpipe(lbl) + '|' : '') + ' ' + id);
+      }
+      prevIds = [id];
+      pending = {};
+      return id;
+    };
+    const labelNext = (lbl) => { for (const p of prevIds) pending[p] = lbl; };
+    const SKIP = /^(@(start|end)|skinparam\b|hide\b|show\b|scale\b|header\b|footer\b|legend\b|caption\b|title\b|partition\b|swimlane\b|detach\b|kill\b|note\b|floating\s+note\b|label\b|end\s*(fork|split|merge)\b|fork\b|split\b)/i;
+
+    for (const raw of lines) {
+      const l = raw.trim();
+      if (!l) continue;
+      // `endwhile` 后面常带**出口标签**（`endwhile (否)`，用户文档 4.3 的写法）：旧正则要求
+      // 立即行尾，于是该行被丢弃 → 循环**回边**与出口标签一起消失，循环被静默画成直线
+      //（审计发现，2026-09-24）。
+      const ew = l.match(/^end\s*while\b\s*(?:\(([^)]*)\))?\s*$/i);
+      if (ew) {
+        const top = stack.pop();
+        if (top) {
+          for (const p of prevIds) out.push('    ' + p + ' --> ' + top.condId);
+          prevIds = [top.condId];
+          pending = {};
+          pending[top.condId] = (ew[1] || 'no').trim() || 'no';
+        }
+        continue;
+      }
+      if (/^endif$/i.test(l)) {
+        const top = stack.pop();
+        if (top) {
+          const yesExit = top.yesExit || [];
+          prevIds = yesExit.concat(prevIds);
+          pending = {};
+        } else {
+          pending = {};
+        }
+        continue;
+      }
+      // 并发分支（fork / split）与 repeat 循环本地无法表达：宁可**整体交回调用方**
+      // （保留原始代码块 + 提示"活动图 fork/split 并发分支"），也不要"忽略后画成顺序图"——
+      // 那会让人误信渲染成功，而并发语义已经丢了。
+      if (/^(fork|split|repeat|end\s*(fork|split|merge))\b/i.test(l)) return null;
+      if (SKIP.test(l)) continue;
+
+      if (/^start$/i.test(l)) {
+        if (prevIds.length === 0) {
+          const id = nid();
+          out.push('    ' + id + '((开始))');
+          prevIds = [id];
+        }
+        continue;
+      }
+      if (/^(stop|end)$/i.test(l)) { newNode('circle', '结束'); continue; }
+
+      if (/^:/.test(l)) {
+        let text = l.replace(/^:/, '').replace(/;\s*$/, '').trim();
+        text = text.replace(/^#\w+\s*[:|]/, '');
+        text = text.replace(/\|/g, '\n').replace(/(?:\r?\n)+/g, '<br/>');
+        if (text) newNode('rect', text);
+        continue;
+      }
+      if (/^->/.test(l)) {
+        const lbl = l.replace(/^->\s*/, '').replace(/;\s*$/, '').trim();
+        if (lbl) labelNext(lbl);
+        continue;
+      }
+
+      const im = l.match(/^if\s*\(([\s\S]+?)\)\s*then\s*(?:\(([^)]*)\))?/i);
+      if (im) {
+        const condId = newNode('diamond', im[1]);
+        stack.push({ k: 'if', condId: condId, yesExit: null });
+        prevIds = [condId];
+        pending = {};
+        pending[condId] = (im[2] || 'yes').trim() || 'yes';
+        continue;
+      }
+      const imm = l.match(/^elseif\s*\(([\s\S]+?)\)\s*then\s*(?:\(([^)]*)\))?/i);
+      if (imm) {
+        const top = stack.length ? stack[stack.length - 1] : null;
+        if (top) {
+          top.yesExit = top.yesExit ? top.yesExit.concat(prevIds) : prevIds.slice();
+          prevIds = [top.condId];
+          pending = {};
+          pending[top.condId] = 'no';
+          const condId = newNode('diamond', imm[1]);
+          top.condId = condId;
+          pending = {};
+          pending[condId] = (imm[2] || 'yes').trim() || 'yes';
+        }
+        continue;
+      }
+      const em = l.match(/^else\s*(?:\(([^)]*)\))?/i);
+      if (em) {
+        const top = stack.length ? stack[stack.length - 1] : null;
+        if (top) {
+          top.yesExit = top.yesExit ? top.yesExit.concat(prevIds) : prevIds.slice();
+          prevIds = [top.condId];
+          pending = {};
+          pending[top.condId] = (em[1] || 'no').trim() || 'no';
+        }
+        continue;
+      }
+
+      // `while (cond) is (标签)`：标签是"继续循环"分支的实际文案（旧实现硬编码 yes）
+      const wm = l.match(/^while\s*\(([\s\S]+?)\)\s*(?:is\s*\(([^)]*)\))?/i);
+      if (wm) {
+        const condId = newNode('diamond', wm[1]);
+        stack.push({ k: 'while', condId: condId });
+        prevIds = [condId];
+        pending = {};
+        pending[condId] = (wm[2] || 'yes').trim() || 'yes';
+        continue;
+      }
+      if (/^(repeat|backward)\b/i.test(l)) continue;
+      const rw = l.match(/^repeat\s+while\s*\(/i);
+      if (rw) continue;
+      // 未识别语句：忽略，避免产出非法 Mermaid
+    }
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  function plantumlMindmapToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['mindmap'];
+    let hasRoot = false;
+    for (const raw of lines) {
+      if (!raw.trim()) continue;
+      if (/^@(start|end)/i.test(raw)) continue;
+      const m = raw.match(/^(\s*)([*+]{1,20})\s*(.*)$/);
+      if (!m) continue;
+      const depth = m[2].length;
+      let text = m[3].trim();
+      text = text.replace(/^\[[^\]]*\]\s*/, '').replace(/^:\s*/, '').trim();
+      if (!text) continue;
+      if (!hasRoot && depth === 1) {
+        out.push(indent(1) + 'root((' + text.replace(/[()]/g, '') + '))');
+        hasRoot = true;
+        continue;
+      }
+      const needQuote = /[()\[\]{}:#"|]/.test(text);
+      const safe = needQuote ? '[' + text.replace(/[\[\]]/g, '') + ']' : text;
+      out.push(indent(depth) + safe);
+    }
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  function plantumlComponentToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const out = ['flowchart LR'];
+    const declared = new Set();
+    const idOf = makeIdAllocator();   // 中文组件/包名不再塌成同一个 id
+    const ARROW_AT = /(\s*)(<-{1,2}|-{1,2}\|?>|\.{2}>|-{1,2}>|o-{1,2}|<\|-{1,2}|\*--|--|\.\.)(\s*)/;
+    // 已开启的分组栈：'sub' = 输出了 subgraph（收尾时要 end）；'plain' = 无名分组（`together {`，只配对不输出）
+    const groups = [];
+
+    const tokenOf = (raw) => {
+      let s = String(raw || '').trim();
+      let shape = 'component';
+      if (/^\(.*\)$/.test(s)) { shape = 'usecase'; s = s.slice(1, -1).trim(); }
+      else if (/^\[.*\]$/.test(s)) { shape = 'component'; s = s.slice(1, -1).trim(); }
+      s = stripQuotes(s);
+      return { id: idOf(s, 'C'), shape: shape, label: s };
+    };
+    const declare = (t) => {
+      if (declared.has(t.id)) return;
+      declared.add(t.id);
+      if (t.shape === 'usecase') out.push('    ' + t.id + '([' + mq(t.label) + '])');
+      // 双圆括号必须**紧贴**文本：`(( "x" ))`（内层留空格）会让 Mermaid 词法在 `))` 前
+      // 期待 DOUBLECIRCLEEND 而直接报 Parse error —— 于是「PlantUML 用例图里的 actor」
+      // 从来没能渲染出来（只是被批次 try/catch 连坐掩盖，另一个缺陷）。实测见 test/browser/_iso-probe。
+      else if (t.shape === 'actor') out.push('    ' + t.id + '((' + mq(t.label) + '))');
+      else out.push('    ' + t.id + '[' + mq(t.label) + ']');
+    };
+    // 注：`together\b` **不在** SKIP 里 —— `together { … }` 是分组，必须参与 `}` 配对，
+    // 否则它的 `}` 会变成孤立 end（见下面 groups 的处理）
+    const SKIP = /^(@(start|end)|skinparam\b|hide\b|show\b|scale\b|title\b|header\b|footer\b|legend\b|caption\b|note\b|left to right direction|top to bottom direction)/i;
+
+    for (const raw of lines) {
+      const l = raw.trim();
+      if (!l || SKIP.test(l)) continue;
+
+      const am = l.match(/^actor\s+("[^"]*"|\S+)(?:\s+as\s+("[^"]*"|\S+))?/i);
+      if (am) {
+        const t = tokenOf(am[1]);
+        t.shape = 'actor';
+        // `actor 质量工程师 as QE`：别名当 id、中文名当显示名。
+        // 历史 bug：把别名写进 label，而箭头里的 QE 又被当成另一个节点 → 图上出现两个 QE。
+        if (am[2]) t.id = idOf(stripQuotes(am[2]), 'C');
+        declare(t);
+        continue;
+      }
+      // 容器声明（带 {）→ subgraph；同一关键字不带 { 时（如 `database 缓存 as Cache`）
+      // 当普通节点处理，避免"这句被忽略、中文名只能靠箭头顺手创建而丢失"
+      // 注：`rectangle` 是 PlantUML 用例图里最常见的分组（`rectangle 系统 { … }`）。历史上它落到
+      // 下面的 dm 分支被当成**普通节点**，而结尾的 `}` 又无条件输出 `end` → **孤立 end** →
+      // Mermaid 直接语法报错（用户报障的 15.2 用例图，2026-09-24）。
+      const pm = l.match(/^(package|node|folder|frame|cloud|database|rectangle|storage|artifact|card)\s+("[^"]*"|\S+)(?:\s+as\s+("[^"]*"|\S+))?\s*(\{)?/i);
+      if (pm) {
+        const title = stripQuotes(pm[2]);
+        if (pm[4]) {
+          out.push('    subgraph ' + idOf(title, 'G') + '[' + mq(title) + ']');
+          groups.push('sub');
+          continue;
+        }
+        declare({ id: pm[3] ? idOf(stripQuotes(pm[3]), 'C') : idOf(title, 'C'), shape: 'component', label: title });
+        continue;
+      }
+      // `together {`：无名透明分组，只参与配对（绝不能输出 end）
+      if (/^together\s*\{/i.test(l)) { groups.push('plain'); continue; }
+      // `}`：只与已开启的分组配对收尾；**孤立的 `}` 一律忽略**
+      if (/^\}/.test(l)) {
+        if (groups.pop() === 'sub') out.push('    end');
+        continue;
+      }
+
+      const dm = l.match(/^(component|usecase|rectangle|interface)\s+("[^"]*"|\S+)(?:\s+as\s+("[^"]*"|\S+))?/i);
+      if (dm) {
+        const t = tokenOf(dm[2]);
+        if (/^usecase$/i.test(dm[1])) t.shape = 'usecase';
+        // 同上：别名当 id，引号里的名字当显示名（否则箭头里的别名会变成第二个节点）
+        if (dm[3]) t.id = idOf(stripQuotes(dm[3]), 'C');
+        declare(t);
+        continue;
+      }
+
+      // 裸声明行：`[采集服务]` / `[采集服务] as Collector` / `(录入检验结果) as UC1`
+      // （历史行为：这类行被直接忽略 → 节点只能靠箭头被"顺手创建"，中文标签全丢）
+      // 括号里**不得再出现括号**，且 `[...]`/`(...)` 之后只允许空格或 `as 别名` ——
+      // 否则 `[Web] --> [API]` 这种带箭头的行会被整行吞掉（既有测试正是这么逮住的）
+      const bm = l.match(/^([\[\(][^\[\]\(\)]*[\]\)])\s*(?:as\s+("[^"]*"|\S+))?\s*$/);
+      if (bm) {
+        const t = tokenOf(bm[1]);
+        if (bm[2]) t.id = idOf(stripQuotes(bm[2]), 'C');   // 别名当 id：箭头里的引用更稳
+        declare(t);
+        continue;
+      }
+
+      const arrow = ARROW_AT.exec(l);
+      if (arrow && arrow.index > 0) {
+        const leftRaw = l.slice(0, arrow.index).trim();
+        const rest = l.slice(arrow.index + arrow[0].length);
+        const rightRaw = rest.split(/\s*:\s*/)[0].trim();
+        if (leftRaw && rightRaw) {
+          const lt = tokenOf(leftRaw);
+          const rt = tokenOf(rightRaw);
+          declare(lt);
+          declare(rt);
+          const raw2 = arrow[2];
+          // 关系语义尽量保真：Mermaid flowchart 支持 `---`（无向/关联）与 `-.->`（虚线），
+          // 旧实现一律压成 `-->` → 关联关系被画成有向依赖（审计发现，2026-09-24）。
+          // 继承/实现（`<|--`）在 flowchart 里没有等价语法，仍退化为 `-->`。
+          let arrowStr = '-->';
+          if (/\.\./.test(raw2)) arrowStr = '-.->';
+          else if (!/[<>]/.test(raw2) && /-/.test(raw2)) arrowStr = '---';
+          // 边标签：`[A] --> [B] : 数据流` 以前整段被丢弃（图看起来正常、语义却没了）。
+          // 这里取出冒号后的内容，用 `-->|标签|` 表达（审计发现，2026-09-24）。
+          const labelM = rest.match(/^\s*[^:]*:\s*([\s\S]+)$/);
+          const ltag = labelM ? '|' + mpipe(labelM[1].trim()) + '|' : '';
+          if (/^</.test(raw2)) out.push('    ' + rt.id + ' ' + arrowStr + ltag + ' ' + lt.id);
+          else out.push('    ' + lt.id + ' ' + arrowStr + ltag + ' ' + rt.id);
+          continue;
+        }
+      }
+      // 纯节点声明：[Name] / (Name) / "Name"
+      if (/^[\[\(("]/.test(l)) {
+        const t = tokenOf(l);
+        if (t.label) declare(t);
+      }
+    }
+    // 源码里少写 `}` 时补齐收尾：保证 subgraph / end 一定配平（Mermaid 对不配平直接报错）
+    while (groups.length) {
+      if (groups.pop() === 'sub') out.push('    end');
+    }
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  /* ---- 甘特图：@startgantt → Mermaid gantt ---- */
+  // 依据 PlantUML Gantt 语言的**常见语句**实现（按语法面，不针对任何示例文档）：
+  //   Project starts <date> / [T] lasts N days|weeks / [T] starts <date|[U]'s end|N days after …>
+  //   / [T] ends <…> / [T] happens at <…>（里程碑）/ [T] -> [U]（依赖）/ [T] is done
+  //   / -- 分组 --（→ Mermaid section）/ title。
+  // **无法可靠解析时返回 null**（调用方保留原代码块 + 提示），不猜、也不静默丢弃任务。
+  // 有意忽略（Mermaid gantt 无对应语义，属表现层）：skinparam / zoom / printscale / hide /
+  //   颜色（is colored in）/ 星期开关（saturday are closed 之类）。
+  const PM_GANTT_MONTHS = {
+    january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6,
+    august: 7, september: 8, october: 9, november: 10, december: 11,
+  };
+  const PM_GANTT_DAY = 86400000;
+
+  // 支持 ISO（2024-01-01 / 2024/1/1）与英文写法（1st of January 2024 / January 1, 2024）
+  function ganttParseDate(raw) {
+    const t = String(raw == null ? '' : raw).trim().replace(/^the\s+/i, '');
+    let m = /^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(t);
+    if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    m = /^(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([A-Za-z]+),?\s+(\d{4})$/.exec(t);
+    if (m && PM_GANTT_MONTHS[m[2].toLowerCase()] !== undefined) {
+      return new Date(Date.UTC(+m[3], PM_GANTT_MONTHS[m[2].toLowerCase()], +m[1]));
+    }
+    m = /^([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/.exec(t);
+    if (m && PM_GANTT_MONTHS[m[1].toLowerCase()] !== undefined) {
+      return new Date(Date.UTC(+m[3], PM_GANTT_MONTHS[m[1].toLowerCase()], +m[2]));
+    }
+    return null;
+  }
+
+  function ganttFmtDate(d) { return d.toISOString().slice(0, 10); }
+
+  function ganttDurationDays(raw) {
+    const m = /^(\d+)\s*(day|days|week|weeks)$/i.exec(String(raw == null ? '' : raw).trim());
+    if (!m) return null;
+    return /week/i.test(m[2]) ? parseInt(m[1], 10) * 7 : parseInt(m[1], 10);
+  }
+
+  // 时间参照：绝对日期 / [U]'s start / [U]'s end / N days (after|before) [U]'s end
+  function ganttParseRef(raw) {
+    const t = String(raw == null ? '' : raw).trim().replace(/^at\s+/i, '');
+    const direct = ganttParseDate(t);
+    if (direct) return { kind: 'date', date: direct };
+    let m = /^\[([^\]]+)\]\s*'s\s*(start|end)$/i.exec(t);
+    if (m) return { kind: m[2].toLowerCase() === 'start' ? 'atStart' : 'afterEnd', name: m[1], offset: 0 };
+    m = /^(\d+)\s*(day|days|week|weeks)\s+(after|before)\s+\[([^\]]+)\]\s*'s\s*(start|end)$/i.exec(t);
+    if (m) {
+      const n = /week/i.test(m[2]) ? parseInt(m[1], 10) * 7 : parseInt(m[1], 10);
+      return {
+        kind: m[5].toLowerCase() === 'start' ? 'atStart' : 'afterEnd',
+        name: m[4],
+        offset: /before/i.test(m[3]) ? -n : n,
+      };
+    }
+    return null;
+  }
+
+  function plantumlGanttToMermaid(src) {
+    const lines = stripPlantumlDecorations(src).split('\n');
+    const tasks = [];
+    const byName = new Map();
+    const NOISE = /^(skinparam|zoom|printscale|hide\b|show\b|language\b|today\b|!|')/i;
+    let projectStart = null;
+    let title = '';
+    let section = '';
+    const taskOf = (name) => {
+      const key = String(name).trim().toLowerCase();
+      if (!byName.has(key)) {
+        const t = { key: key, name: String(name).trim(), deps: [] };
+        byName.set(key, t);
+        tasks.push(t);
+      }
+      return byName.get(key);
+    };
+
+    for (const raw of lines) {
+      const line = String(raw).trim();
+      if (!line || /^@(start|end)/i.test(line)) continue;
+      if (line.charAt(0) === "'") continue;
+      if (/^--.*--$/.test(line)) { section = line.replace(/^--\s*/, '').replace(/\s*--$/, '').trim(); continue; }
+      if (/^title\s+/i.test(line)) { title = line.replace(/^title\s+/i, '').trim(); continue; }
+      if (/^project\s+starts?\b/i.test(line)) {
+        const d = ganttParseDate(line.replace(/^project\s+starts?\s+(?:at\s+|the\s+)?/i, ''));
+        if (!d) return null;
+        projectStart = d;
+        continue;
+      }
+      // 日历设置：Mermaid gantt 无对应语义
+      if (/^[A-Za-z]+\s+are\s+(closed|open|working)/i.test(line)) continue;
+      if (NOISE.test(line)) continue;
+      const dep = /^\[([^\]]+)\]\s*-{1,2}>{1,2}\s*\[([^\]]+)\]\s*$/.exec(line);
+      if (dep) { taskOf(dep[2]).deps.push(taskOf(dep[1]).key); continue; }
+      const m = /^\[([^\]]+)\]\s+(.+)$/.exec(line);
+      if (!m) continue;                    // 其它指令（日历、皮肤等）：忽略
+      const t = taskOf(m[1]);
+      const rest = m[2].trim();
+      if (t.section === undefined && section) t.section = section;
+      let mm;
+      if ((mm = /^(?:lasts|takes?)\s+(.+)$/i.exec(rest))) {
+        const d = ganttDurationDays(mm[1]);
+        if (d === null) return null;
+        t.days = d;
+        continue;
+      }
+      if ((mm = /^starts?\s+(.+)$/i.exec(rest))) {
+        const ref = ganttParseRef(mm[1]);
+        if (!ref) return null;
+        t.startRef = ref;
+        continue;
+      }
+      if ((mm = /^ends?\s+(.+)$/i.exec(rest))) {
+        const ref = ganttParseRef(mm[1]);
+        if (!ref) return null;
+        t.endRef = ref;
+        continue;
+      }
+      if ((mm = /^happens\s+(?:at|on|in)\s+(.+)$/i.exec(rest))) {
+        const ref = ganttParseRef(mm[1]);
+        if (!ref) return null;
+        t.milestone = true;
+        t.days = 0;
+        t.startRef = ref;
+        continue;
+      }
+      if (/^is\s+colou?red\s+in\s+/i.test(rest)) continue;     // 颜色：表现层，忽略
+      if (/^is\s+(done|completed|finished)\b/i.test(rest)) { t.done = true; continue; }
+      if (/^is\s+(closed|open)\b/i.test(rest)) continue;        // 日历
+      return null;   // 无法解析的任务语句 → 保留原代码块（不猜）
+    }
+    if (!tasks.length) return null;
+
+    const addDays = (d, n) => new Date(d.getTime() + n * PM_GANTT_DAY);
+    const resolveRef = (ref) => {
+      if (ref.kind === 'date') return ref.date;
+      const other = byName.get(String(ref.name).trim().toLowerCase());
+      if (!other) return null;
+      if (ref.kind === 'afterEnd') return other.end ? addDays(other.end, ref.offset) : null;
+      return other.start ? addDays(other.start, ref.offset) : null;
+    };
+
+    // ① 显式绝对起点；② 迭代消解引用（含由 lasts 推出的终点），最多 tasks.length + 2 轮
+    for (const t of tasks) if (t.startRef && t.startRef.kind === 'date') t.start = t.startRef.date;
+    if (projectStart && !tasks.some((t) => t.start)) tasks[0].start = projectStart;
+    for (let pass = 0; pass < tasks.length + 2; pass++) {
+      let moved = false;
+      for (const t of tasks) {
+        if (!t.start && t.startRef) {
+          const d = resolveRef(t.startRef);
+          if (d) { t.start = d; moved = true; }
+        }
+        if (t.start && t.days != null && !t.end) { t.end = addDays(t.start, t.days); moved = true; }
+        if (t.endRef) {
+          const d = resolveRef(t.endRef);
+          if (d && (!t.end || t.end.getTime() !== d.getTime())) {
+            t.end = d;
+            if (!t.start) t.start = addDays(d, -(t.days || 0));
+            moved = true;
+          }
+        }
+      }
+      if (!moved) break;
+    }
+    // ③ 仍无起点者：按声明顺序接在前一任务之后（PlantUML gantt 的默认行为），
+    //    且不得早于其依赖任务的结束。
+    let prevEnd = projectStart;
+    for (const t of tasks) {
+      if (!t.start) {
+        const depEnds = t.deps.map((k) => (byName.get(k) || {}).end).filter(Boolean);
+        const base = depEnds.length
+          ? new Date(Math.max.apply(null, depEnds.map((d) => d.getTime())))
+          : prevEnd;
+        if (!base) return null;
+        t.start = base;
+      }
+      if (t.days == null) t.days = t.milestone ? 0 : 1;
+      if (!t.end) t.end = addDays(t.start, t.days);
+      prevEnd = t.end;
+    }
+
+    // 输出 Mermaid gantt（统一用绝对日期，确定性输出，便于单测）
+    const esc = (s) => String(s).replace(/[:;,]/g, ' ').replace(/\s+/g, ' ').trim() || '任务';
+    const out = ['gantt'];
+    if (title) out.push('    title ' + esc(title));
+    out.push('    dateFormat YYYY-MM-DD');
+    let curSection = null;
+    tasks.forEach((t, i) => {
+      const sec = t.section || '';
+      if (sec !== curSection) { if (sec) out.push('    section ' + esc(sec)); curSection = sec; }
+      const tags = [];
+      if (t.milestone) tags.push('milestone');
+      if (t.done) tags.push('done');
+      const days = t.milestone ? 0 : Math.max(1, Math.round((t.end - t.start) / PM_GANTT_DAY));
+      out.push('    ' + esc(t.name) + ' :' + (tags.length ? tags.join(', ') + ', ' : '') +
+        't' + (i + 1) + ', ' + ganttFmtDate(t.start) + ', ' + days + 'd');
+    });
+    return out.join('\n');
+  }
+
+  /* ---- 「超出本地子集」特征指纹 → 人类可读提示 ---- */
+  // 用途：把「超出本地支持的语法子集」这种笼统说法，换成"检测到哪条语法"，
+  // 既出现在预览的提示条，也拼进引擎抛出的错误信息。
+  // 原则：**只做关键字识别**，识别不到就返回空数组（不编造原因）。
+  const UNSUPPORTED_HINTS = {
+    plantuml: [
+      [/@startjson/i, '@startjson'],
+      [/@startyaml/i, '@startyaml'],
+      [/@startsalt/i, '@startsalt'],
+      [/^\s*(?:fork|split|repeat)\b/im, '活动图 fork/split 并发分支'],
+      // create / destroy 现在都受支持（create 会改写为 Mermaid 的 `create participant X`），
+      // 不再算"超出子集" —— 原来这里的提示会让用户以为不支持（审计发现，2026-09-25）。
+      [/^\s*(?:skinparam|!include|!define|!theme|!pragma)\b/im, 'skinparam / 预处理指令'],
+      [/^\s*autonumber\b/im, '时序图 autonumber'],
+      // 甘特图必须有具体日期才能转成 Mermaid（Mermaid 的 gantt 需要起始日期）：
+      // 只有 `[任务] lasts 3 days` 而没有 `Project starts …` / `[任务] starts …` 时给出**可操作**的
+      // 提示，而不是笼统的"超出子集"（审计发现，2026-09-25）。
+      [/@startgantt(?![\s\S]*\d{4}-\d{2}-\d{2})(?![\s\S]*\bstarts?\b)/i, '甘特图的起始日期（写 `Project starts 2026-09-01` 或 `[任务] starts at …`）'],
+    ],
+    tikz: [
+      [/\\begin\{axis\}/, 'pgfplots 的 \\begin{axis}'],
+      [/\\matrix\b/, '\\matrix 矩阵布局'],
+      [/\\tikzset\b/, '\\tikzset 自定义样式'],
+      [/\.style\s*=/, '自定义样式（.style=…）'],
+      [/\\usetikzlibrary/, '\\usetikzlibrary'],
+      [/\b(?:node\s+distance|right\s+of|left\s+of|above\s+of|below\s+of)\b/i, '相对定位（node distance / right of…）'],
+      [/(?:\barc\b|\.\.\s*controls|\]\s*to\s*\[)/, '弧线 / 贝塞尔曲线 / to[…]'],
+      [/\b(?:rotate|skew\s*[xy])\s*=/, 'rotate / skew'],
+      [/\b(?:grid|sin|cos|parabola)\b|\\path\b/, 'grid / sin / cos / parabola / \\path'],
+      [/\\(?:clip|shade|pattern|decorate)\b/, '\\clip / \\shade / \\pattern / decorations'],
+    ],
+  };
+
+  function unsupportedHints(type, source) {
+    const table = UNSUPPORTED_HINTS[String(type == null ? '' : type).toLowerCase()];
+    if (!table) return [];
+    const text = String(source == null ? '' : source);
+    const out = [];
+    for (let i = 0; i < table.length; i++) {
+      if (table[i][0].test(text) && out.indexOf(table[i][1]) === -1) out.push(table[i][1]);
+    }
+    return out;
+  }
+
+  // 统一入口：PlantUML → Mermaid；不支持时返回 null（调用方保留原代码块）
+  function plantumlToMermaid(src) {
+    const text = stripPlantumlDecorations(src);
+    const kind = plantumlKind(text);
+    switch (kind) {
+      case 'mindmap': return plantumlMindmapToMermaid(src);
+      case 'sequence': return plantumlSequenceToMermaid(src);
+      case 'state': return plantumlStateToMermaid(src);
+      case 'activity': return plantumlActivityToMermaid(src);
+      case 'usecase':
+      case 'component': return plantumlComponentToMermaid(src);
+      case 'class': return plantumlClassToMermaid(src);
+      case 'gantt': return plantumlGanttToMermaid(src);
+      default: return null;
+    }
+  }
+
+  /* ============================================================
+   * 3. D2 → Mermaid
+   * ------------------------------------------------------------
+   * 支持：direction、a -> b: label、a <- b、a <-> b、a -- b、
+   *       key: label、key.shape: circle/diamond/cylinder/...、
+   *       嵌套块 key: { ... }、# 行注释。
+   * 不覆盖：样式类（style.fill/stroke）、class、icon、markdown 块、vars、imports。
+   * ============================================================ */
+
+  function d2ShapeWrap(id, label, shape) {
+    const l = mq(label == null ? id : label);
+    switch (String(shape || '').toLowerCase()) {
+      case 'circle': return '((' + l + '))';
+      case 'diamond': return '{' + l + '}';
+      case 'oval': return '([' + l + '])';
+      case 'cylinder':
+      case 'stored_data': return '[(' + l + ')]';
+      case 'person': return '(( ' + l + ' ))';
+      case 'hexagon': return '{{' + l + '}}';
+      case 'queue': return '[/' + l + '/]';
+      case 'cloud': return '([' + l + '])';
+      case 'parallelogram': return '[/' + l + '/]';
+      case 'document': return '[/' + l + '\\]';
+      case 'text': return label === id ? '' : '[' + l + ']';
+      default: return '[' + l + ']';
+    }
+  }
+
+  function d2ToMermaid(src) {
+    const rawLines = stripComments(String(src == null ? '' : src), { hashLine: true }).split('\n');
+    const nodes = new Map();
+    const events = [];
+    let direction = 'LR';
+    // 名称 → 唯一 id；labelOf 保留原始名字，供"没有显式 label"的节点当默认标签
+    // （否则中文节点在图上会显示成 n1）。
+    const allocId = makeIdAllocator();
+    const labelOf = new Map();
+    // 已声明的容器名（块）：用于把层级引用 `边缘节点.缓冲` 归一成容器内的 `缓冲`
+    // （否则同一声明与引用会各建一个节点 → 图上出现两个同名节点；审计发现，2026-09-24）
+    const containerTitles = new Set();
+    const idOf = (s) => {
+      let raw = stripQuotes(String(s).trim());
+      if (raw.indexOf('.') !== -1) {
+        const segs = raw.split('.');
+        if (containerTitles.has(segs[0])) raw = segs.slice(1).join('.');
+      }
+      const id = allocId(raw, 'N');
+      if (!labelOf.has(id)) labelOf.set(id, raw);
+      return id;
+    };
+
+    const parse = (lines, prefix) => {
+      let i = 0;
+      while (i < lines.length) {
+        const l = String(lines[i]).trim();
+        i++;
+        if (!l) continue;
+
+        const dm = l.match(/^direction\s*:\s*(\w+)/i);
+        if (dm) {
+          const v = dm[1].toLowerCase();
+          direction = v === 'right' ? 'LR' : v === 'left' ? 'RL' : v === 'up' ? 'BT' : 'TB';
+          continue;
+        }
+
+        // 嵌套块：key: {
+        // 键名允许**任意非空白字符**（含中文、点号）：旧实现用 `[\w.$-]+`，中文键名一律不匹配
+        // → 中文容器不生成子图、中文属性/节点全部丢失（审计发现，2026-09-24）
+        const bm = l.match(/^("[^"]*"|[^\s:{}#]+)\s*:\s*\{\s*$/);
+        if (bm) {
+          const title = stripQuotes(bm[1]);
+          const name = (prefix || '') + idOf(title);
+          containerTitles.add(title);
+          events.push({ t: 'open', name: name, title: title });
+          const inner = [];
+          let depth = 1;
+          while (i < lines.length) {
+            const il = lines[i];
+            i++;
+            depth += (il.match(/\{/g) || []).length - (il.match(/\}/g) || []).length;
+            if (depth <= 0) break;
+            inner.push(il);
+          }
+          parse(inner, name + '_');
+          events.push({ t: 'close' });
+          continue;
+        }
+
+        // 属性行：key.shape / key.label / key.style.*
+        const pm = l.match(/^("[^"]*"|[^\s:{}#]+)\.([^\s:{}#]+)\s*:\s*(.+)$/);
+        if (pm) {
+          // 取属性链的最后一段：`边缘节点.缓冲.shape: cylinder` 的属性是 shape（旧实现只认 ASCII）
+          const prop = String(pm[2]).split('.').pop().toLowerCase();
+          const val = stripQuotes(pm[3]);
+          // 只认 shape / label；style.* / class / icon / markdown 等表现层属性**整行忽略** ——
+          // 否则会凭空建出一个名叫 `style` 的幽灵节点（历史 bug）。
+          if (prop === 'shape' || prop === 'label') {
+            const id = idOf(pm[1]);
+            const n = nodes.get(id) || {};
+            if (prop === 'shape') n.shape = val; else n.label = val;
+            nodes.set(id, n);
+          }
+          continue;
+        }
+
+        // 关系
+        const cmRe = /^(.*?)\s*(<->|<--|-->|<-|->|--)\s*(.+)$/;
+        const cm = cmRe.exec(l);
+        if (cm) {
+          const left = stripQuotes(cm[1].trim());
+          const rightRaw = cm[3].trim();
+          let right = rightRaw;
+          let label = '';
+          const ci = rightRaw.indexOf(':');
+          if (ci !== -1) { label = rightRaw.slice(ci + 1).trim(); right = rightRaw.slice(0, ci).trim(); }
+          right = stripQuotes(right);
+          // D2 的 `...` 表示"延续上一个节点"，不是节点名（旧实现会生成一个标签为 `...` 的
+          // 幽灵节点）；本地不追踪链式上下文，直接忽略该边而不是造假节点。
+          if (right === '...' || left === '...') continue;
+          if (left && right) {
+            const op = cm[2];
+            const arrow = op === '<->' ? '<-->' : (op === '--' ? '---' : '-->');
+            // `A <- B` 语义是 B → A（旧实现方向反了：审计发现，2026-09-24）
+            const reverse = (op === '<-' || op === '<--');
+            events.push({
+              t: 'edge',
+              from: idOf(reverse ? right : left),
+              to: idOf(reverse ? left : right),
+              arrow: arrow,
+              label: label,
+            });
+            continue;
+          }
+        }
+
+        // 单节点：key: label
+        // 但**已知的 D2 图级属性**要先排除，否则 `grid-columns: 2` 会凭空建出一个
+        // 名叫 grid-columns 的幽灵节点（审计发现，2026-09-24）。
+        // 只排除**确实只可能是图级配置**的两个键。收窄过一次：早先还排除了
+        // label/shape/style/class/…，但 `shape: 入口` 这种"节点名恰好叫 shape"会被误吞
+        //（审计复核发现）—— D2 里 `key: value` 绝大多数是节点声明，宁多建节点不可丢节点。
+        const GRAPH_ATTR = /^(grid(-\w+)?|direction)$/i;
+        const sm = l.match(/^("[^"]*"|[^\s:{}#]+)\s*:\s*([\s\S]+)$/);
+        if (sm && GRAPH_ATTR.test(stripQuotes(sm[1]))) continue;
+        if (sm) {
+          const id = idOf(sm[1]);
+          const n = nodes.get(id) || {};
+          n.label = stripQuotes(sm[2]);
+          nodes.set(id, n);
+          events.push({ t: 'node', id: id });
+          continue;
+        }
+        if (/^("[^"]*"|[^\s:{}#]+)$/.test(l)) {
+          const id = idOf(l);
+          if (!nodes.has(id)) nodes.set(id, {});
+          events.push({ t: 'node', id: id });
+        }
+      }
+    };
+    parse(rawLines, '');
+
+    const out = ['flowchart ' + direction];
+    const emitted = new Set();
+    const emitNode = (id) => {
+      if (emitted.has(id)) return;
+      emitted.add(id);
+      const n = nodes.get(id) || {};
+      // 显式 .label 优先；否则用原始名称（中文节点不再显示成 n1）
+      out.push('    ' + id + d2ShapeWrap(id, n.label || labelOf.get(id), n.shape));
+    };
+    for (const ev of events) {
+      if (ev.t === 'open') out.push('    subgraph ' + ev.name + '[' + mq(ev.title) + ']');
+      else if (ev.t === 'close') out.push('    end');
+      else if (ev.t === 'node') emitNode(ev.id);
+      else if (ev.t === 'edge') {
+        emitNode(ev.from);
+        emitNode(ev.to);
+        out.push('    ' + ev.from + ' ' + ev.arrow + (ev.label ? '|' + mpipe(ev.label) + '|' : '') + ' ' + ev.to);
+      }
+    }
+    for (const id of nodes.keys()) emitNode(id);
+    if (out.length <= 1) return null;
+    return out.join('\n');
+  }
+
+  /* ============================================================
+   * 4. 表达式解析器（plot 与 TikZ 坐标共用）
+   * ------------------------------------------------------------
+   * 自研递归下降解析器，**不使用 eval / new Function**（预览内容来自用户文档，
+   * 任何形式的代码求值都是 XSS 面）。支持：
+   *   + - * / % ^（以及 **）、一元正负、括号、隐式乘法（2x、3sin(x)）
+   *   常量 pi/e/tau、函数 sin cos tan asin acos atan sinh cosh tanh
+   *   exp ln log log2 log10 sqrt abs floor ceil round sign min max pow mod atan2 hypot
+   * ============================================================ */
+
+  const EXPR_FUNCS = {
+    sin: Math.sin, cos: Math.cos, tan: Math.tan,
+    asin: Math.asin, acos: Math.acos, atan: Math.atan,
+    sinh: Math.sinh, cosh: Math.cosh, tanh: Math.tanh,
+    exp: Math.exp, sqrt: Math.sqrt, abs: Math.abs,
+    floor: Math.floor, ceil: Math.ceil, round: Math.round,
+    sign: Math.sign,
+    ln: Math.log, log: Math.log10, log2: Math.log2, log10: Math.log10,
+    min: Math.min, max: Math.max, pow: Math.pow, mod: (a, b) => a % b,
+    atan2: Math.atan2, hypot: Math.hypot,
+  };
+  const EXPR_CONSTS = { pi: Math.PI, e: Math.E, tau: Math.PI * 2, inf: Infinity };
+
+  function tokenizeExpr(src) {
+    const toks = [];
+    let i = 0;
+    const s = String(src == null ? '' : src);
+    while (i < s.length) {
+      const c = s[i];
+      if (/\s/.test(c)) { i++; continue; }
+      if (/[0-9.]/.test(c)) {
+        const m = s.slice(i).match(/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/);
+        if (!m) return null;
+        toks.push({ t: 'num', v: parseFloat(m[0]) });
+        i += m[0].length;
+        continue;
+      }
+      if (/[A-Za-z_]/.test(c)) {
+        const m = s.slice(i).match(/^[A-Za-z_][A-Za-z_0-9]*/);
+        toks.push({ t: 'name', v: m[0] });
+        i += m[0].length;
+        continue;
+      }
+      if (s.startsWith('**', i)) { toks.push({ t: 'op', v: '^' }); i += 2; continue; }
+      if ('+-*/%^(),'.indexOf(c) !== -1) { toks.push({ t: 'op', v: c }); i++; continue; }
+      return null; // 未知字符 → 整式判定失败
+    }
+    return toks;
+  }
+
+  // 返回 (x) => number 或 null
+  function compileExpr(src) {
+    const toks = tokenizeExpr(src);
+    if (!toks || toks.length === 0) return null;
+    let p = 0;
+    let bad = false;
+
+    const peek = () => toks[p];
+    const eat = (v) => {
+      const t = toks[p];
+      if (t && t.t === 'op' && t.v === v) { p++; return true; }
+      return false;
+    };
+
+    const parseExpr = () => {
+      let node = parseTerm();
+      for (;;) {
+        const t = peek();
+        if (t && t.t === 'op' && (t.v === '+' || t.v === '-')) {
+          p++;
+          const rhs = parseTerm();
+          const op = t.v;
+          const a = node;
+          node = (x) => (op === '+' ? a(x) + rhs(x) : a(x) - rhs(x));
+          continue;
+        }
+        break;
+      }
+      return node;
+    };
+
+    const parseTerm = () => {
+      let node = parseUnary();
+      for (;;) {
+        const t = peek();
+        if (t && t.t === 'op' && '*/%'.indexOf(t.v) !== -1) {
+          p++;
+          const rhs = parseUnary();
+          const op = t.v;
+          const a = node;
+          node = (x) => {
+            const av = a(x);
+            const bv = rhs(x);
+            if (op === '*') return av * bv;
+            if (op === '/') return av / bv;
+            return av % bv;
+          };
+          continue;
+        }
+        // 隐式乘法：2x / 2(x+1) / (x+1)(x-1)
+        if (t && ((t.t === 'num' && false) || t.t === 'name' || (t.t === 'op' && t.v === '('))) {
+          const rhs = parseUnary();
+          const a = node;
+          node = (x) => a(x) * rhs(x);
+          continue;
+        }
+        break;
+      }
+      return node;
+    };
+
+    const parseUnary = () => {
+      const t = peek();
+      if (t && t.t === 'op' && (t.v === '-' || t.v === '+')) {
+        p++;
+        const inner = parseUnary();
+        if (t.v === '-') return (x) => -inner(x);
+        return inner;
+      }
+      return parsePower();
+    };
+
+    const parsePower = () => {
+      const base = parseAtom();
+      const t = peek();
+      if (t && t.t === 'op' && t.v === '^') {
+        p++;
+        const expo = parseUnary(); // 右结合
+        return (x) => Math.pow(base(x), expo(x));
+      }
+      return base;
+    };
+
+    const parseAtom = () => {
+      const t = peek();
+      if (!t) { bad = true; return () => NaN; }
+      if (t.t === 'num') { p++; const v = t.v; return () => v; }
+      if (t.t === 'name') {
+        p++;
+        const name = t.v;
+        if (eat('(')) {
+          const args = [];
+          if (!eat(')')) {
+            args.push(parseExpr());
+            while (eat(',')) args.push(parseExpr());
+            if (!eat(')')) { bad = true; return () => NaN; }
+          }
+          const fn = EXPR_FUNCS[name.toLowerCase()];
+          if (!fn) { bad = true; return () => NaN; }
+          return (x) => fn.apply(null, args.map((f) => f(x)));
+        }
+        const lower = name.toLowerCase();
+        if (Object.prototype.hasOwnProperty.call(EXPR_CONSTS, lower)) {
+          const c = EXPR_CONSTS[lower];
+          return () => c;
+        }
+        // 变量只认 x / t。未知标识符**绝不能静默当成 x**：`plot a*x`（a 未定义）会被画成
+        // y = x²，而图例仍显示 `a*x` —— 看起来完全正常、实际是错的（审计发现，2026-09-24）。
+        // 标记失败，交由调用方（plotToSvg 返回 null → 保留源码 + 提示）。
+        if (lower === 'x' || lower === 't') return (x) => x;
+        bad = true;
+        return () => NaN;
+      }
+      if (t.t === 'op' && t.v === '(') {
+        p++;
+        const inner = parseExpr();
+        if (!eat(')')) { bad = true; return () => NaN; }
+        return inner;
+      }
+      bad = true;
+      return () => NaN;
+    };
+
+    const root = parseExpr();
+    if (bad || p !== toks.length) return null;
+    return root;
+  }
+
+  /* ============================================================
+   * 5. plot（gnuplot 风格子集）→ 原生 SVG
+   * ------------------------------------------------------------
+   * 支持指令：
+   *   set title "文本" | set xlabel "x" | set ylabel "y"
+   *   set xrange [-6.28:6.28]  或  set xrange -6.28 6.28
+   *   set yrange [...]          set grid on|off        set samples 400
+   *   plot <expr>[, <expr> ...]  每条可带 title "名称" / with lines|points|linespoints
+   *   散点：plot '-' 后跟数据行（x y）   —— 本子集把 `-` 行视为数据块
+   * 说明：坐标轴与文字使用 currentColor，自动适配深浅主题。
+   * ============================================================ */
+
+  const PLOT_PALETTE = ['#2563eb', '#dc2626', '#16a34a', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#65a30d', '#f97316', '#0ea5e9'];
+
+  function plotQuote(s) {
+    const t = String(s || '').trim();
+    const m = t.match(/^"([\s\S]*)"$/) || t.match(/^'([\s\S]*)'$/);
+    return m ? m[1] : t;
+  }
+
+  // 范围边界：纯数字走 parseFloat 快路径，其余按**表达式**求值
+  // （gnuplot 里 `set trange [0:2*pi]` 很常见，用 parseFloat 会把 2*pi 读成 2）
+  function plotBound(s) {
+    const t = String(s == null ? '' : s).trim();
+    if (/^[+-]?\d+(?:\.\d+)?$/.test(t)) return parseFloat(t);
+    const fn = compileExpr(t);
+    if (!fn) return NaN;
+    const v = fn(0);
+    return isFinite(v) ? v : NaN;
+  }
+
+  function parseRangeArg(s) {
+    let t = String(s || '').trim();
+    const br = t.match(/^\[([\s\S]*)\]$/);
+    if (br) t = br[1];
+    const parts = t.split(/[:,]/).map((x) => x.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      const a = plotBound(parts[0]);
+      const b = plotBound(parts[1]);
+      if (isFinite(a) && isFinite(b) && b > a) return [a, b];
+    }
+    const nums = t.split(/\s+/).map(plotBound).filter((x) => isFinite(x));
+    if (nums.length >= 2 && nums[1] > nums[0]) return [nums[0], nums[1]];
+    return null;
+  }
+
+  function niceTicks(min, max, count) {
+    const span = max - min;
+    if (!(span > 0)) return [min];
+    const raw = span / Math.max(2, count);
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    const step = (norm >= 5 ? 5 : norm >= 2 ? 2 : norm >= 1 ? 1 : 0.5) * mag;
+    const out = [];
+    const start = Math.ceil(min / step) * step;
+    for (let v = start; v <= max + step * 1e-6; v += step) out.push(Number(v.toFixed(10)));
+    return out;
+  }
+
+  function fmtNum(v) {
+    if (!isFinite(v)) return '';
+    const a = Math.abs(v);
+    if (a !== 0 && (a < 1e-3 || a >= 1e5)) return v.toExponential(1);
+    return String(Number(v.toFixed(4)));
+  }
+
+  function plotToSvg(src, opts) {
+    const o = opts || {};
+    const W = o.width || 680;
+    const H = o.height || 400;
+    const cfg = {
+      title: '', xlabel: 'x', ylabel: 'y', grid: false, samples: 400,
+      xrange: null, yrange: null, series: [], points: [],
+      // 参数方程（gnuplot `set parametric`）：plot 的两个表达式是 x(t), y(t)
+      parametric: false, trange: null,
+    };
+    const lines = String(src == null ? '' : src).split('\n');
+    let dataMode = false;
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line || line[0] === '#') continue;
+      if (dataMode) {
+        if (line === 'e' || line === 'end') { dataMode = false; continue; }
+        const nums = line.split(/[\s,]+/).map(Number).filter((x) => isFinite(x));
+        if (nums.length >= 2) cfg.points.push([nums[0], nums[1]]);
+        continue;
+      }
+      if (/^unset\s+parametric\b/i.test(line)) { cfg.parametric = false; continue; }
+      const sm = line.match(/^set\s+(\w+)\s*(.*)$/i);
+      if (sm) {
+        const key = sm[1].toLowerCase();
+        const val = sm[2].trim();
+        if (key === 'title') cfg.title = plotQuote(val);
+        else if (key === 'xlabel') cfg.xlabel = plotQuote(val);
+        else if (key === 'ylabel') cfg.ylabel = plotQuote(val);
+        else if (key === 'xrange') cfg.xrange = parseRangeArg(val) || cfg.xrange;
+        else if (key === 'yrange') cfg.yrange = parseRangeArg(val) || cfg.yrange;
+        // 裸 `set grid`（无参数）在 gnuplot 里就是**开启**网格；旧实现只认 on/true/1 →
+        // 空串被判成关闭（审计发现，2026-09-24）
+        else if (key === 'grid') cfg.grid = val === '' ? true : !/^(off|false|0|no)$/i.test(val);
+        else if (key === 'samples') { const n = parseInt(val, 10); if (n >= 10 && n <= 5000) cfg.samples = n; }
+        // `set parametric`（无参数即开启）；`set trange [0:2*pi]` 指定参数区间
+        else if (key === 'parametric') cfg.parametric = !/^(off|false|0|no)$/i.test(val);
+        else if (key === 'trange') cfg.trange = parseRangeArg(val) || cfg.trange;
+        continue;
+      }
+      const pm = line.match(/^plot\s+([\s\S]+)$/i);
+      if (pm) {
+        const seg = stripComments(pm[1], { hashLine: true }).split(';')[0];
+        // 数据文件规格：`'-'`（可带 `using 1:2`、`title "…"` 等修饰）或裸 `-`。
+        // 注意别把负号开头的表达式（如 `plot -x**2 + 10`）误判成数据文件。
+        const segTrim = seg.trim();
+        if (/^['"]-['"](\s|$)/.test(segTrim) || segTrim === '-') { dataMode = true; continue; }
+        // 参数方程：`set parametric` 下 plot 的两个表达式是 x(t), y(t)，**不能**当成两条
+        // 函数曲线按 x 采样 —— 那会画出"看着像样但完全不对"的图（原先就是被静默降级成这样）。
+        // 这里按 trange 对 t 采样，得到真正的 (x(t), y(t)) 轨迹。
+        if (cfg.parametric) {
+          const specs = splitTopLevel(seg, ',').map((s) => s.trim()).filter(Boolean);
+          if (specs.length < 2) return null; // 参数方程必须给出两个表达式，否则不猜
+          const stripKw = (s) => {
+            const kw = s.search(/\s(?:title|with|lt|lc|lw|color|linecolor)\b/i);
+            return (kw === -1 ? s : s.slice(0, kw)).trim();
+          };
+          const tm = specs.map((s) => s.match(/\btitle\s+("[^"]*"|'[^']*')/i)).find(Boolean);
+          const fx = compileExpr(stripKw(specs[0]));
+          const fy = compileExpr(stripKw(specs[1]));
+          if (!fx || !fy) return null;
+          const [ta, tb] = cfg.trange || [0, 1];
+          const n = Math.max(10, cfg.samples);
+          const pts = [];
+          for (let k = 0; k <= n; k++) {
+            const tv = ta + (tb - ta) * (k / n);
+            const xv = fx(tv);
+            const yv = fy(tv);
+            pts.push([isFinite(xv) ? xv : NaN, isFinite(yv) ? yv : NaN]);
+          }
+          cfg.series.push({
+            fn: null, pts: pts,
+            expr: specs.join(', '),
+            title: tm ? plotQuote(tm[1]) : 'x(t), y(t)',
+            style: 'lines', color: null,
+          });
+          continue;
+        }
+        for (const part of splitTopLevel(seg, ',')) {
+          const spec = part.trim();
+          if (!spec) continue;
+          const kw = spec.search(/\s(?:title|with|lt|lc|lw|color|linecolor)\b/i);
+          const exprText = (kw === -1 ? spec : spec.slice(0, kw)).trim();
+          const rest = kw === -1 ? '' : spec.slice(kw);
+          const tm = rest.match(/\btitle\s+("[^"]*"|'[^']*')/i);
+          const wm = rest.match(/\bwith\s+(\w+)/i);
+          const cm = rest.match(/\b(?:lc|color|linecolor)\s+(?:rgb\s+)?("[^"]*"|'[^']*'|#\w{3,8}|\w+)/i);
+          if (!exprText) continue;
+          const fn = compileExpr(exprText);
+          if (!fn) return null; // 有无法解析的表达式 → 交给调用方提示
+          let color = null;
+          if (cm) {
+            const cv = plotQuote(cm[1]);
+            color = /^#/.test(cv) ? cv : (TIKZ_COLORS[cv.toLowerCase()] || null);
+          }
+          cfg.series.push({
+            fn: fn,
+            expr: exprText,
+            title: tm ? plotQuote(tm[1]) : exprText,
+            style: wm ? wm[1].toLowerCase() : 'lines',
+            color: color,
+          });
+        }
+        continue;
+      }
+      // 裸数据行
+      const nums = line.split(/[\s,]+/).map(Number).filter((x) => isFinite(x));
+      if (nums.length >= 2) cfg.points.push([nums[0], nums[1]]);
+    }
+    if (cfg.series.length === 0 && cfg.points.length === 0) return null;
+
+    const pad = { l: 62, r: 18, t: cfg.title ? 40 : 18, b: cfg.xlabel ? 48 : 34 };
+    const w = W - pad.l - pad.r;
+    const h = H - pad.t - pad.b;
+
+    // 采样
+    const sampled = cfg.series.map((s) => {
+      // 参数方程已在解析阶段采完（x、y 都来自 t），不能再按 xrange 重采一次
+      if (s.pts) return s.pts;
+      const pts = [];
+      const [xa, xb] = cfg.xrange || [-10, 10];
+      const n = Math.max(10, cfg.samples);
+      for (let i = 0; i <= n; i++) {
+        const x = xa + (xb - xa) * (i / n);
+        let y;
+        try { y = s.fn(x); } catch (e) { y = NaN; }
+        pts.push([x, typeof y === 'number' && isFinite(y) ? y : NaN]);
+      }
+      return pts;
+    });
+
+    // 值域
+    let xmin; let xmax; let ymin; let ymax;
+    if (cfg.xrange) { xmin = cfg.xrange[0]; xmax = cfg.xrange[1]; }
+    else {
+      const xs = [];
+      for (const pts of sampled) for (const p of pts) xs.push(p[0]);
+      for (const p of cfg.points) xs.push(p[0]);
+      xmin = Math.min.apply(null, xs);
+      xmax = Math.max.apply(null, xs);
+    }
+    const ys = [];
+    for (const pts of sampled) for (const p of pts) if (isFinite(p[1])) ys.push(p[1]);
+    for (const p of cfg.points) ys.push(p[1]);
+    if (cfg.yrange) { ymin = cfg.yrange[0]; ymax = cfg.yrange[1]; }
+    else if (ys.length) {
+      ymin = Math.min.apply(null, ys);
+      ymax = Math.max.apply(null, ys);
+      if (ymin === ymax) { ymin -= 1; ymax += 1; }
+      const mp = (ymax - ymin) * 0.08;
+      ymin -= mp; ymax += mp;
+    } else { ymin = -1; ymax = 1; }
+
+    const sx = (x) => pad.l + (x - xmin) / (xmax - xmin) * w;
+    const sy = (y) => pad.t + (ymax - y) / (ymax - ymin) * h;
+
+    const tb = [];
+    tb.push('<svg class="tm-diagram-svg tm-plot" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" font-family="inherit">');
+    tb.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="none"/>');
+
+    // 网格
+    const xticks = niceTicks(xmin, xmax, 8);
+    const yticks = niceTicks(ymin, ymax, 6);
+    if (cfg.grid) {
+      for (const t of xticks) tb.push('<line x1="' + sx(t).toFixed(2) + '" y1="' + pad.t + '" x2="' + sx(t).toFixed(2) + '" y2="' + (pad.t + h) + '" stroke="currentColor" stroke-opacity="0.12"/>');
+      for (const t of yticks) tb.push('<line x1="' + pad.l + '" y1="' + sy(t).toFixed(2) + '" x2="' + (pad.l + w) + '" y2="' + sy(t).toFixed(2) + '" stroke="currentColor" stroke-opacity="0.12"/>');
+    }
+    tb.push('<rect x="' + pad.l + '" y="' + pad.t + '" width="' + w + '" height="' + h + '" fill="none" stroke="currentColor" stroke-opacity="0.35"/>');
+    // 零轴
+    if (ymin < 0 && ymax > 0) tb.push('<line x1="' + pad.l + '" y1="' + sy(0).toFixed(2) + '" x2="' + (pad.l + w) + '" y2="' + sy(0).toFixed(2) + '" stroke="currentColor" stroke-opacity="0.5"/>');
+    if (xmin < 0 && xmax > 0) tb.push('<line x1="' + sx(0).toFixed(2) + '" y1="' + pad.t + '" x2="' + sx(0).toFixed(2) + '" y2="' + (pad.t + h) + '" stroke="currentColor" stroke-opacity="0.5"/>');
+    // 刻度
+    for (const t of xticks) {
+      tb.push('<line x1="' + sx(t).toFixed(2) + '" y1="' + (pad.t + h) + '" x2="' + sx(t).toFixed(2) + '" y2="' + (pad.t + h + 4) + '" stroke="currentColor"/>');
+      tb.push('<text x="' + sx(t).toFixed(2) + '" y="' + (pad.t + h + 16) + '" font-size="11" text-anchor="middle" fill="currentColor">' + escapeHtml(fmtNum(t)) + '</text>');
+    }
+    for (const t of yticks) {
+      tb.push('<line x1="' + (pad.l - 4) + '" y1="' + sy(t).toFixed(2) + '" x2="' + pad.l + '" y2="' + sy(t).toFixed(2) + '" stroke="currentColor"/>');
+      tb.push('<text x="' + (pad.l - 8) + '" y="' + (sy(t) + 4).toFixed(2) + '" font-size="11" text-anchor="end" fill="currentColor">' + escapeHtml(fmtNum(t)) + '</text>');
+    }
+    if (cfg.title) tb.push('<text x="' + (W / 2) + '" y="22" font-size="15" font-weight="600" text-anchor="middle" fill="currentColor">' + escapeHtml(cfg.title) + '</text>');
+    if (cfg.xlabel) tb.push('<text x="' + (pad.l + w / 2) + '" y="' + (H - 6) + '" font-size="12" text-anchor="middle" fill="currentColor">' + escapeHtml(cfg.xlabel) + '</text>');
+    if (cfg.ylabel) tb.push('<text x="14" y="' + (pad.t + h / 2) + '" font-size="12" text-anchor="middle" fill="currentColor" transform="rotate(-90 14 ' + (pad.t + h / 2) + ')">' + escapeHtml(cfg.ylabel) + '</text>');
+
+    // 曲线
+    sampled.forEach((pts, idx) => {
+      const s = cfg.series[idx];
+      const color = s.color || PLOT_PALETTE[idx % PLOT_PALETTE.length];
+      const withLines = s.style !== 'points';
+      const withPoints = s.style === 'points' || s.style === 'linespoints';
+      let d = '';
+      let pen = false;
+      for (const p of pts) {
+        if (!isFinite(p[1])) { pen = false; continue; }
+        const X = sx(p[0]);
+        const Y = sy(p[1]);
+        if (Y < pad.t - h * 4 || Y > pad.t + h * 5) { pen = false; continue; }
+        if (withLines) d += (pen ? 'L' : 'M') + X.toFixed(2) + ' ' + Y.toFixed(2) + ' ';
+        if (withPoints) d += 'M' + X.toFixed(2) + ' ' + Y.toFixed(2) + ' l0.01 0 ';
+        pen = true;
+      }
+      if (d) {
+        tb.push('<path d="' + d.trim() + '" fill="none" stroke="' + color + '" stroke-width="' + (withPoints && !withLines ? 3.2 : 2) + '" stroke-linejoin="round" stroke-linecap="round"/>');
+      }
+    });
+    // 散点数据
+    if (cfg.points.length) {
+      let d = '';
+      for (const p of cfg.points) d += 'M' + sx(p[0]).toFixed(2) + ' ' + sy(p[1]).toFixed(2) + ' l0.01 0 ';
+      tb.push('<path d="' + d.trim() + '" fill="none" stroke="' + PLOT_PALETTE[0] + '" stroke-width="3.4" stroke-linecap="round"/>');
+    }
+    // 图例
+    const legendItems = cfg.series.map((s, i) => ({ label: s.title, color: s.color || PLOT_PALETTE[i % PLOT_PALETTE.length] }));
+    if (legendItems.length > 1 || (legendItems.length === 1 && legendItems[0].label)) {
+      let ly = pad.t + 6;
+      const lx = pad.l + w - 6;
+      tb.push('<g font-size="12" text-anchor="end" fill="currentColor">');
+      for (const it of legendItems) {
+        tb.push('<line x1="' + (lx - 34) + '" y1="' + (ly - 4) + '" x2="' + (lx - 20) + '" y2="' + (ly - 4) + '" stroke="' + it.color + '" stroke-width="2.4"/>');
+        tb.push('<text x="' + lx + '" y="' + ly + '">' + escapeHtml(it.label) + '</text>');
+        ly += 18;
+      }
+      tb.push('</g>');
+    }
+    tb.push('</svg>');
+    return tb.join('\n');
+  }
+
+  /* ============================================================
+   * 6. TikZ 子集 → 原生 SVG
+   * ------------------------------------------------------------
+   * 支持：
+   *   \draw[opts] (x,y) -- (x,y) -- ... ;       折线
+   *   \draw[opts] (x,y) -- cycle ;              多边形
+   *   \draw[opts] (x,y) circle (r) ;            圆
+   *   \draw[opts] (x,y) rectangle (x,y) ;       矩形
+   *   \fill[color] ... / \filldraw ...          填充
+   *   \node[opts] at (x,y) {文本} ;             文本节点
+   *   \draw ... node[midway,above] {文本} ... ;  路径内联文本
+   *   opts: red/blue/... 、thick/thin/very thick/ultra thick、dashed/dotted/dash dot、
+   *         ->/<-/<-> 、fill=color、draw=color、opacity=n、scale=n、line width=npt
+   * 不覆盖：\foreach、\matrix、\begin{axis}(pgfplots)、贝塞尔/弧线参数、坐标变换(rotate/skew)、
+   *         样式定义 (\tikzset)、\newcommand、外部 \usetikzlibrary。
+   * 坐标单位：裸数字按 cm 处理（与 TikZ 一致）；支持 pt/mm/cm/in 后缀。
+   * ============================================================ */
+
+  const TIKZ_COLORS = {
+    red: '#e11d48', blue: '#2563eb', green: '#16a34a', black: 'currentColor',
+    gray: '#6b7280', grey: '#6b7280', white: '#ffffff', orange: '#f97316',
+    purple: '#7c3aed', violet: '#8b5cf6', cyan: '#0891b2', magenta: '#db2777',
+    pink: '#ec4899', yellow: '#eab308', brown: '#92400e', teal: '#0d9488',
+    olive: '#65a30d', lime: '#84cc16', lightgray: '#d1d5db', darkgray: '#374151',
+  };
+
+  const CM_PER_PT = 1 / 28.4527;
+
+  // 长度 → cm（defUnit 为无后缀时的默认单位）
+  function tikzLength(s, defUnit) {
+    const t = String(s == null ? '' : s).trim();
+    if (!t) return NaN;
+    const m = t.match(/^(-?[\d.]+(?:[eE][+-]?\d+)?)\s*(pt|cm|mm|in)?$/i);
+    if (m) {
+      const v = parseFloat(m[1]);
+      const u = (m[2] || defUnit || 'cm').toLowerCase();
+      if (u === 'pt') return v * CM_PER_PT;
+      if (u === 'mm') return v / 10;
+      if (u === 'in') return v * 2.54;
+      return v;
+    }
+    const fn = compileExpr(t);
+    if (!fn) return NaN;
+    const v = fn(0);
+    return isFinite(v) ? v : NaN;
+  }
+
+  // ---- TikZ plot 表达式 → JS ----
+  // PGF 的三角函数**默认按度**求值，写成 `sin(\x r)` 才是弧度。这里：
+  //   \x → x；`sin(... r)` 去掉 r（弧度正是 JS 的语义）；无 r/deg 后缀的三角函数按度→弧度包裹。
+  // 这样 `{0.2*\x*\x}` 与 `{sin(\x r)}` 都得到与 TikZ 一致的结果，而不是"看起来对"的猜。
+  function tikzDegToRad(s) {
+    return String(s).replace(
+      /\b(sin|cos|tan|sec|csc|cot)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g,
+      (m, fn, arg) => {
+        const a = String(arg).trim();
+        if (/\br\s*$/.test(a)) return fn + '(' + a.replace(/\br\s*$/, '').trim() + ')';
+        if (/\bdeg\s*$/.test(a)) return fn + '(' + a.replace(/\bdeg\s*$/, '').trim() + ' * pi / 180)';
+        return fn + '(' + a + ' * pi / 180)';
+      },
+    );
+  }
+
+  function compileTikzExpr(raw) {
+    let s = String(raw == null ? '' : raw).trim();
+    const br = s.match(/^\{([\s\S]*)\}$/);
+    if (br) s = br[1].trim();
+    s = s.replace(/\\x(?![A-Za-z])/g, 'x');
+    s = tikzDegToRad(s);
+    return compileExpr(s);
+  }
+
+  // ---- \foreach 展开 ----
+  // 支持 `\foreach \x in {0,1,...,8} <单条命令>;` 与 `\foreach \x in {a,b} { ... }`。
+  // 在拆分命令**之前**做纯文本展开，所以展开出来的命令会被后续流程正常识别。
+  function expandForeachList(spec) {
+    const parts = String(spec).split(',').map((x) => x.trim()).filter((x) => x !== '');
+    const dots = parts.indexOf('...');
+    if (dots === 1 && parts.length >= 3) {
+      // 形式二：{1,...,5} —— 步长 1
+      const a = plotBound(parts[0]);
+      const z = plotBound(parts[2]);
+      return foreachRange(a, 1, z);
+    }
+    if (dots === 2 && parts.length >= 4) {
+      // 形式一：{0,1,...,8} / {0,2,...,10} —— 步长由前两项差决定
+      const a = plotBound(parts[0]);
+      const b = plotBound(parts[1]);
+      const z = plotBound(parts[3]);
+      return foreachRange(a, b - a, z);
+    }
+    return parts;
+  }
+
+  function foreachRange(a, step, z) {
+    if (!isFinite(a) || !isFinite(step) || !isFinite(z) || step === 0) return [];
+    const out = [];
+    const up = step > 0;
+    if (up ? z < a : z > a) return out;
+    for (let v = a, guard = 0; guard < 500; guard++) {
+      if (up ? v > z + 1e-9 : v < z - 1e-9) break;
+      out.push(String(Number(v.toFixed(6))));
+      v += step;
+    }
+    return out;
+  }
+
+  function expandTikzForeach(src) {
+    let out = String(src == null ? '' : src);
+    for (let guard = 0; guard < 200; guard++) {
+      const m = out.match(/\\foreach\s*\\([A-Za-z]+)\s+in\s*\{([^{}]*)\}\s*/);
+      if (!m) break;
+      const varName = m[1];
+      const items = expandForeachList(m[2]);
+      let p = m.index + m[0].length;
+      let body;
+      let isBlock = false;
+      if (out.charAt(p) === '{') {
+        const end = matchBracket(out, p, '{', '}');
+        if (end < 0) break;
+        body = out.slice(p + 1, end);
+        p = end + 1;
+        isBlock = true; // 花括号体内自带 `;`，直接拼接即可
+      } else {
+        // 单条命令：扫到顶层 `;` 为止（该 `;` 不在 body 内，展开时要补回）
+        let depth = 0;
+        let q = p;
+        for (; q < out.length; q++) {
+          const c = out.charAt(q);
+          if (c === '{' || c === '[' || c === '(') depth++;
+          else if (c === '}' || c === ']' || c === ')') depth--;
+          else if (c === ';' && depth <= 0) break;
+        }
+        if (q >= out.length) break;
+        body = out.slice(p, q);
+        p = q + 1;
+      }
+      const reVar = new RegExp('\\\\' + varName + '(?![A-Za-z])', 'g');
+      // 单条命令形式必须用 `;` 重新分隔：否则多条命令会被粘成一条，
+      // 后续按 `;` 拆命令时只认到最后一个分号，整段被当成一条路径。
+      const expanded = items.map((v) => body.replace(reVar, v)).join(isBlock ? ' ' : '; ')
+        + (isBlock ? '' : ';');
+      out = out.slice(0, m.index) + expanded + out.slice(p);
+    }
+    return out;
+  }
+
+  function tikzOptions(str) {
+    const st = { color: null, width: 0.4, dash: null, arrow: '', fill: null, opacity: 1, scale: 1, font: null, domain: null, samples: 0 };
+    const parts = splitTopLevel(String(str || ''), ',');
+    for (const raw of parts) {
+      const t = raw.trim();
+      if (!t) continue;
+      if (/^very\s+thick$/i.test(t)) { st.width = 1.0; continue; }
+      if (/^ultra\s+thick$/i.test(t)) { st.width = 1.6; continue; }
+      if (/^thick$/i.test(t)) { st.width = 0.8; continue; }
+      if (/^thin$/i.test(t)) { st.width = 0.2; continue; }
+      if (/^semi\s+thick$/i.test(t)) { st.width = 0.6; continue; }
+      if (/^dashed$/i.test(t)) { st.dash = '6 3'; continue; }
+      if (/^dotted$/i.test(t)) { st.dash = '1.5 3'; continue; }
+      if (/^dash\s*dot(ted)?$/i.test(t)) { st.dash = '6 3 1.5 3'; continue; }
+      if (t === '->' || t === '-|>' || t === '-latex') { st.arrow = 'end'; continue; }
+      if (t === '<-' || t === '<|-' || t === 'latex-') { st.arrow = 'start'; continue; }
+      if (t === '<->' || t === '<|-|>' || t === '<->>') { st.arrow = 'both'; continue; }
+      if (/^scale\s*=/.test(t)) { const v = parseFloat(t.split('=')[1]); if (isFinite(v) && v > 0) st.scale = v; continue; }
+      // \draw[domain=0:4, samples=100] plot (\x, {...})；也可写在 \begin{tikzpicture}[...]
+      if (/^domain\s*=/.test(t)) { const r = parseRangeArg(t.slice(t.indexOf('=') + 1)); if (r) st.domain = r; continue; }
+      if (/^samples\s*=/.test(t)) { const n = parseInt(t.split('=')[1], 10); if (n >= 2 && n <= 2000) st.samples = n; continue; }
+      if (/^opacity\s*=/.test(t)) { const v = parseFloat(t.split('=')[1]); if (isFinite(v)) st.opacity = Math.max(0, Math.min(1, v)); continue; }
+      if (/^line\s+width\s*=/.test(t)) { const v = tikzLength(t.split('=')[1], 'pt'); if (isFinite(v)) st.width = v; continue; }
+      if (/^font\s*=/.test(t)) {
+        const v = t.split('=')[1];
+        const fm = v.match(/\\(\w+)?size|(\d+)/);
+        void fm;
+        if (/huge|Large|LARGE/i.test(v)) st.font = 18;
+        else if (/large|Large/i.test(v)) st.font = 15;
+        else if (/small/i.test(v)) st.font = 10;
+        else if (/tiny|scriptsize|footnotesize/i.test(v)) st.font = 8;
+        continue;
+      }
+      if (/^fill\s*=/.test(t)) {
+        const v = t.split('=')[1].trim().toLowerCase();
+        st.fill = TIKZ_COLORS[v] || (/^#/.test(v) ? v : null);
+        continue;
+      }
+      if (/^draw\s*=/.test(t)) {
+        const v = t.split('=')[1].trim().toLowerCase();
+        st.color = TIKZ_COLORS[v] || (/^#/.test(v) ? v : null);
+        continue;
+      }
+      const key = t.toLowerCase();
+      if (TIKZ_COLORS[key]) { st.color = TIKZ_COLORS[key]; continue; }
+      if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(t)) { st.color = t; continue; }
+    }
+    return st;
+  }
+
+  function tikzText(raw) {
+    let s = String(raw == null ? '' : raw);
+    s = s.replace(/\\textbf\{([^{}]*)\}/g, '$1').replace(/\\textit\{([^{}]*)\}/g, '$1');
+    s = s.replace(/\$([^$]*)\$/g, '$1');
+    s = s.replace(/\\\\/g, '<br/>');
+    s = s.replace(/[{}]/g, '');
+    return s.trim();
+  }
+
+  function tikzTokenizePath(path) {
+    const toks = [];
+    let i = 0;
+    const s = String(path || '');
+    while (i < s.length) {
+      const c = s[i];
+      if (/\s/.test(c)) { i++; continue; }
+      if (c === '(') {
+        const end = matchBracket(s, i, '(', ')');
+        if (end < 0) break;
+        toks.push({ t: 'coord', v: s.slice(i + 1, end) });
+        i = end + 1;
+        continue;
+      }
+      if (c === '{') {
+        const end = matchBracket(s, i, '{', '}');
+        if (end < 0) break;
+        toks.push({ t: 'brace', v: s.slice(i + 1, end) });
+        i = end + 1;
+        continue;
+      }
+      if (c === '[') {
+        const end = matchBracket(s, i, '[', ']');
+        if (end < 0) break;
+        toks.push({ t: 'opt', v: s.slice(i + 1, end) });
+        i = end + 1;
+        continue;
+      }
+      if (c === '-' && s[i + 1] === '-') { toks.push({ t: 'op', v: '--' }); i += 2; continue; }
+      const m = s.slice(i).match(/^[A-Za-z]+/);
+      if (m) { toks.push({ t: 'op', v: m[0].toLowerCase() }); i += m[0].length; continue; }
+      i++;
+    }
+    return toks;
+  }
+
+  function tikzToSvg(src, opts) {
+    const o = opts || {};
+    const raw = String(src == null ? '' : src);
+    const text = expandTikzForeach(
+      raw
+        .replace(/\\begin\{tikzpicture\}(\s*\[[^\]]*\])?/g, '')
+        .replace(/\\end\{tikzpicture\}/g, ''),
+    );
+    if (!/\\/.test(text)) return null;
+
+    // 弧线 / 贝塞尔 / to[…] 目前解析不了。历史行为是"直接忽略并照常输出" —— 得到的是一张
+    // **少了几段却看起来正常**的图，比失败更危险（会被误信为渲染成功）。这里改为交回调用方：
+    // 保留原始代码块，并由渲染层给出"检测到未支持语法 弧线 / 贝塞尔曲线 / to[…]"的提示。
+    // 判定前先**剥离 {…} 文本节点**：`\node {go to [home]}` 这类标签文本会命中 `to [`，
+    // 让本可正常渲染的图被整体放弃（审计复核发现）。剥成 `{}` 即可，位置信息不影响这些判定。
+    const noText = raw.replace(/\{[^{}]*\}/g, '{}');
+    if (/\barc\s*[\(\[]/.test(noText) || /\.\.\s*controls\b/.test(noText) ||
+        /\bto\s*\[/.test(noText) || /\]\s*to\s*\[/.test(noText)) return null;
+
+    let globalScale = 1;
+    let globalDomain = null;
+    let globalSamples = 0;
+    // 图片级选项要在剥离 \begin{tikzpicture} **之前**抓取：
+    // 原实现先 replace 掉 \begin{tikzpicture} 再 match 含它的正则 → 永远匹配不到（死代码），
+    // 等价于 `[scale=…]`/`[domain=…]` 全被忽略。
+    const head = raw.match(/\\begin\{tikzpicture\}\s*\[([^\]]*)\]/);
+    if (head) {
+      // 词边界：旧正则会把 `xscale=2` / `yscale=3` 里的 `scale=2` 也当成整体等比缩放
+      // （于是只该单轴缩放的图被整体放大；审计发现，2026-09-24）
+      const gs = head[1].match(/(?<![A-Za-z_])scale\s*=\s*([\d.]+)/);
+      if (gs) { const v = parseFloat(gs[1]); if (v > 0) globalScale = v; }
+      const gopts = tikzOptions(head[1]);
+      globalDomain = gopts.domain || null;
+      globalSamples = gopts.samples || 0;
+    }
+
+    // 拆命令
+    const cmds = [];
+    {
+      const re = /\\(draw|fill|filldraw|shade|node|path)\b/g;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        let depth = 0;
+        let q = false;
+        let j = m.index + m[0].length;
+        for (; j < text.length; j++) {
+          const c = text[j];
+          if (q) { if (c === '"') q = false; continue; }
+          if (c === '"') { q = true; continue; }
+          if (c === '{' || c === '[' || c === '(') depth++;
+          else if (c === '}' || c === ']' || c === ')') depth--;
+          else if (c === ';' && depth <= 0) break;
+        }
+        cmds.push({ cmd: m[1].toLowerCase(), body: text.slice(m.index + m[0].length, j) });
+        re.lastIndex = j + 1;
+      }
+    }
+    if (cmds.length === 0) return null;
+
+    const items = []; // {kind:'poly'|'circle'|'rect'|'text', ...}
+    const parseCoord = (str) => {
+      const parts = splitTopLevel(String(str), ',');
+      if (parts.length < 2) return null;
+      const x = tikzLength(parts[0], 'cm');
+      const y = tikzLength(parts[1], 'cm');
+      if (!isFinite(x) || !isFinite(y)) return null;
+      return { x: x, y: y };
+    };
+
+    for (const c of cmds) {
+      let rest = c.body;
+      let optStr = '';
+      const om = rest.match(/^\s*\[/);
+      if (om) {
+        const b = rest.indexOf('[');
+        const e = matchBracket(rest, b, '[', ']');
+        if (e > 0) { optStr = rest.slice(b + 1, e); rest = rest.slice(e + 1); }
+      }
+      const st = tikzOptions(optStr);
+
+      if (c.cmd === 'node') {
+        const nm = rest.match(/^\s*(?:\[([^\]]*)\])?\s*(?:at\s*)?\(([^()]*)\)\s*(?:\[([^\]]*)\])?\s*\{([\s\S]*)\}\s*$/);
+        if (!nm) continue;
+        const at = parseCoord(nm[2]);
+        if (!at) continue;
+        const st2 = tikzOptions((nm[1] || '') + ',' + (nm[3] || ''));
+        let anchor = 'middle';
+        if (/\babove\b/i.test(nm[1] || '') || /\babove\b/i.test(nm[3] || '')) anchor = 'above';
+        else if (/\bbelow\b/i.test(nm[1] || '') || /\bbelow\b/i.test(nm[3] || '')) anchor = 'below';
+        else if (/\bleft\b/i.test(nm[1] || '')) anchor = 'left';
+        else if (/\bright\b/i.test(nm[1] || '')) anchor = 'right';
+        items.push({ kind: 'text', at: at, text: tikzText(nm[4]), color: st2.color, font: st2.font, anchor: anchor });
+        continue;
+      }
+      // `\path` 只在带 draw 等选项时才画线（`\path[draw] (0,0) -- (1,1)`），本地不解析选项 →
+      // 静默忽略会得到"少一条线却看似成功"的图，故交回调用方（保留原块 + 提示）。
+      if (c.cmd === 'path') return null;
+
+      // 路径：draw / fill / filldraw / shade
+      const isFill = c.cmd === 'fill' || c.cmd === 'filldraw' || c.cmd === 'shade';
+      const isStroke = c.cmd === 'draw' || c.cmd === 'filldraw';
+      const toks = tikzTokenizePath(rest);
+      let pts = [];
+      let lastPt = null;
+      let prevPt = null;
+      let startPt = null;
+      let i = 0;
+      const flush = () => {
+        if (pts.length >= 2) items.push({ kind: 'poly', pts: pts.slice(), style: st, fill: isFill, stroke: isStroke });
+        else if (pts.length === 1 && isFill) items.push({ kind: 'poly', pts: [pts[0], pts[0]], style: st, fill: true, stroke: false });
+        pts = [];
+        startPt = null;
+      };
+      while (i < toks.length) {
+        const t = toks[i];
+        if (t.t === 'coord') {
+          const p = parseCoord(t.v);
+          if (p) { pts.push(p); prevPt = lastPt; lastPt = p; if (!startPt) startPt = p; }
+          i++;
+          continue;
+        }
+        if (t.t === 'op') {
+          const op = t.v;
+          if (op === '--' || op === 'to' || op === 'edge') { i++; continue; }
+          if (op === 'cycle') { if (startPt) pts.push(startPt); flush(); lastPt = null; prevPt = null; i++; continue; }
+          if (op === 'circle') {
+            const rTok = toks[i + 1];
+            if (rTok && rTok.t === 'coord' && lastPt) {
+              const r = tikzLength(rTok.v, 'cm');
+              if (isFinite(r) && r > 0) items.push({ kind: 'circle', c: lastPt, r: r, style: st, fill: isFill, stroke: isStroke });
+              i += 2;
+            } else { i++; }
+            continue;
+          }
+          if (op === 'rectangle') {
+            const rTok = toks[i + 1];
+            if (rTok && rTok.t === 'coord' && lastPt) {
+              const p2 = parseCoord(rTok.v);
+              if (p2) items.push({ kind: 'rect', a: lastPt, b: p2, style: st, fill: isFill, stroke: isStroke });
+              i += 2;
+            } else { i++; }
+            continue;
+          }
+          if (op === 'node') {
+            let j = i + 1;
+            let nopt = '';
+            if (toks[j] && toks[j].t === 'opt') { nopt = toks[j].v; j++; }
+            let ntext = '';
+            if (toks[j] && toks[j].t === 'brace') { ntext = toks[j].v; j++; }
+            const anchorPt = prevPt && lastPt
+              ? { x: (prevPt.x + lastPt.x) / 2, y: (prevPt.y + lastPt.y) / 2 }
+              : lastPt;
+            if (anchorPt && ntext) {
+              let anchor = 'middle';
+              if (/above/i.test(nopt)) anchor = 'above';
+              else if (/below/i.test(nopt)) anchor = 'below';
+              else if (/left/i.test(nopt)) anchor = 'left';
+              else if (/right/i.test(nopt)) anchor = 'right';
+              items.push({ kind: 'text', at: anchorPt, text: tikzText(ntext), color: null, font: tikzOptions(nopt).font, anchor: anchor });
+            }
+            i = j;
+            continue;
+          }
+          if (op === 'plot') {
+            // TikZ 的 `\draw[...] plot (\x, {<expr>})`：以 \x 参数化，在 domain 上按 samples 采样。
+            // 默认 domain=-5:5（与 TikZ 一致）；结果是一段折线，因此能吃到线宽/颜色/虚线等样式。
+            const c = toks[i + 1];
+            if (c && c.t === 'coord') {
+              const parts = splitTopLevel(c.v, ',');
+              if (parts.length === 2) {
+                const fx = compileTikzExpr(parts[0]);
+                const fy = compileTikzExpr(parts[1]);
+                const dom = st.domain || globalDomain || [-5, 5];
+                const n = Math.max(2, Math.min(2000, st.samples || globalSamples || 50));
+                const pts = [];
+                if (fx && fy) {
+                  for (let k = 0; k <= n; k++) {
+                    const xv = dom[0] + (dom[1] - dom[0]) * (k / n);
+                    const px = fx(xv);
+                    const py = fy(xv);
+                    if (isFinite(px) && isFinite(py)) pts.push({ x: px, y: py });
+                  }
+                }
+                if (pts.length >= 2) {
+                  items.push({ kind: 'poly', pts: pts, style: st, fill: false, stroke: true });
+                  // 让紧跟在 plot 后面的 `node[right] {…}` 落在曲线末端（常见写法）
+                  prevPt = pts.length >= 2 ? pts[pts.length - 2] : null;
+                  lastPt = pts[pts.length - 1];
+                }
+              }
+              i += 2;
+              continue;
+            }
+            i++;
+            continue;
+          }
+          if (op === 'grid' || op === 'arc' || op === 'sin' || op === 'cos' || op === 'controls' || op === 'parabola') {
+            // 这些路径语法解析不了。历史行为是「跳过其后的坐标参数」—— 结果是一张**少了几段
+            // 却看起来正常**的图（比失败更危险，用户会误信渲染成功）。与 arc / controls 口径一致：
+            // 交回调用方（保留原代码块 + 提示缺哪条语法）。
+            return null;
+          }
+          i++;
+          continue;
+        }
+        i++;
+      }
+      flush();
+    }
+
+    // 计算包围盒（cm 空间）
+    let minX = Infinity; let minY = Infinity; let maxX = -Infinity; let maxY = -Infinity;
+    const grow = (x, y) => {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    };
+    for (const it of items) {
+      if (it.kind === 'poly') for (const p of it.pts) grow(p.x, p.y);
+      else if (it.kind === 'circle') { grow(it.c.x - it.r, it.c.y - it.r); grow(it.c.x + it.r, it.c.y + it.r); }
+      else if (it.kind === 'rect') { grow(it.a.x, it.a.y); grow(it.b.x, it.b.y); }
+      else if (it.kind === 'text') { grow(it.at.x, it.at.y); grow(it.at.x + 0.6, it.at.y + 0.3); }
+    }
+    if (!isFinite(minX)) return null;
+
+    const spanX = Math.max(maxX - minX, 0.5);
+    const spanY = Math.max(maxY - minY, 0.5);
+    const padPx = 22;
+    const maxW = o.width || 700;
+    let k = 37.795 * globalScale;
+    k = Math.min(k, (maxW - padPx * 2) / spanX);
+    if (!isFinite(k) || k <= 0) k = 30;
+    const W = Math.round(spanX * k + padPx * 2);
+    const H = Math.round(spanY * k + padPx * 2);
+    const X = (x) => (x - minX) * k + padPx;
+    const Y = (y) => (maxY - y) * k + padPx;
+
+    const g = [];
+    g.push('<svg class="tm-diagram-svg tm-tikz" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" role="img" font-family="inherit">');
+    g.push('<defs>');
+    g.push('<marker id="tm-tikz-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>');
+    g.push('<marker id="tm-tikz-dot" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5"><circle cx="5" cy="5" r="4" fill="currentColor"/></marker>');
+    g.push('</defs>');
+
+    for (const it of items) {
+      const st = it.style || { color: null, width: 0.4, dash: null, arrow: '', fill: null, opacity: 1 };
+      const stroke = it.stroke === false ? 'none' : (st.color || 'currentColor');
+      const fill = it.fill ? (st.fill || st.color || 'currentColor') : 'none';
+      const wid = Math.max(0.6, st.width * CM_PER_PT * 28.4527); // pt → px（1pt = 1.333px）
+      const dash = st.dash ? ' stroke-dasharray="' + st.dash + '"' : '';
+      const op = st.opacity < 1 ? ' stroke-opacity="' + st.opacity + '" fill-opacity="' + st.opacity + '"' : '';
+      const mk = st.arrow === 'end' ? ' marker-end="url(#tm-tikz-arrow)"'
+        : st.arrow === 'start' ? ' marker-start="url(#tm-tikz-arrow)"'
+          : st.arrow === 'both' ? ' marker-start="url(#tm-tikz-arrow)" marker-end="url(#tm-tikz-arrow)"' : '';
+      const common = 'fill="' + fill + '" stroke="' + stroke + '" stroke-width="' + wid.toFixed(2) + '"' + dash + op + mk + ' stroke-linejoin="round" stroke-linecap="round"';
+
+      if (it.kind === 'poly') {
+        const d = it.pts.map((p, idx) => (idx === 0 ? 'M' : 'L') + X(p.x).toFixed(2) + ' ' + Y(p.y).toFixed(2)).join(' ');
+        g.push('<path d="' + d + '" ' + common + '/>');
+      } else if (it.kind === 'circle') {
+        g.push('<circle cx="' + X(it.c.x).toFixed(2) + '" cy="' + Y(it.c.y).toFixed(2) + '" r="' + (it.r * k).toFixed(2) + '" ' + common + '/>');
+      } else if (it.kind === 'rect') {
+        const x1 = Math.min(X(it.a.x), X(it.b.x));
+        const y1 = Math.min(Y(it.a.y), Y(it.b.y));
+        g.push('<rect x="' + x1.toFixed(2) + '" y="' + y1.toFixed(2) + '" width="' + Math.abs(X(it.b.x) - X(it.a.x)).toFixed(2) + '" height="' + Math.abs(Y(it.b.y) - Y(it.a.y)).toFixed(2) + '" ' + common + '/>');
+      } else if (it.kind === 'text') {
+        let dx = 0;
+        let dy = 4;
+        let anchor = 'middle';
+        if (it.anchor === 'above') dy = -8;
+        else if (it.anchor === 'below') dy = 16;
+        else if (it.anchor === 'left') { anchor = 'end'; dx = -6; }
+        else if (it.anchor === 'right') { anchor = 'start'; dx = 6; }
+        const fs = it.font || 13;
+        g.push('<text x="' + (X(it.at.x) + dx).toFixed(2) + '" y="' + (Y(it.at.y) + dy).toFixed(2) + '" font-size="' + fs + '" text-anchor="' + anchor + '" fill="' + (it.color || 'currentColor') + '">' + escapeHtml(it.text) + '</text>');
+      }
+    }
+    g.push('</svg>');
+    return g.join('\n');
+  }
+
+
+  /* ============================================================
+   * 语言路由（供 diagram-renderers 判定围栏语言归属）
+   * ============================================================ */
+  // 转 Mermaid 的语言别名（键为围栏 info 的小写形式）
+  const MERMAID_ALIASES = {
+    plantuml: 'plantuml', puml: 'plantuml', uml: 'plantuml', pu: 'plantuml',
+    d2: 'd2',
+  };
+  // 直出 SVG 的语言别名
+  const SVG_ALIASES = { tikz: 'tikz', pgf: 'tikz', tikzpicture: 'tikz', plot: 'plot', gnuplot: 'plot' };
+  // ```latex / ```tex 只在明确含 tikzpicture 环境时才视为 TikZ（普通 LaTeX 文档不该被当图渲染）
+  const CONDITIONAL_TIKZ = { latex: true, tex: true };
+
+  // 围栏语言 → 归属。返回 { kind, type } 或 null
+  //   kind: 'mermaid'（转 Mermaid）/ 'svg'（直出 SVG）
+  function classify(lang, source) {
+    const l = String(lang == null ? "" : lang).trim().toLowerCase();
+    if (!l) return null;
+    if (Object.prototype.hasOwnProperty.call(MERMAID_ALIASES, l)) {
+      return { kind: 'mermaid', type: MERMAID_ALIASES[l] };
+    }
+    if (Object.prototype.hasOwnProperty.call(SVG_ALIASES, l)) {
+      return { kind: 'svg', type: SVG_ALIASES[l] };
+    }
+    if (Object.prototype.hasOwnProperty.call(CONDITIONAL_TIKZ, l) &&
+        /\\begin\{tikzpicture\}/.test(String(source == null ? "" : source))) {
+      return { kind: 'svg', type: 'tikz' };
+    }
+    return null;
+  }
+
+  // 把源码转成 Mermaid 图描述；不支持时返回 null（调用方保留原代码块）
+  function toMermaid(type, source) {
+    if (type === 'plantuml') return plantumlToMermaid(source);
+    if (type === 'd2') return d2ToMermaid(source);
+    return null;
+  }
+
+  // 把源码渲染成 SVG 字符串；不支持时返回 null
+  function toSvg(type, source, opts) {
+    if (type === 'tikz') return tikzToSvg(source, opts);
+    if (type === 'plot') return plotToSvg(source, opts);
+    return null;
+  }
+
+  const api = {
+    // 纯转换（可零依赖单测）
+    plantumlToMermaid: plantumlToMermaid,
+    d2ToMermaid: d2ToMermaid,
+    tikzToSvg: tikzToSvg,
+    plotToSvg: plotToSvg,
+    compileExpr: compileExpr,
+    // 路由
+    classify: classify,
+    toMermaid: toMermaid,
+    toSvg: toSvg,
+    // 「超出子集」的特征提示（供预览提示条与引擎错误信息使用）
+    unsupportedHints: unsupportedHints,
+    MERMAID_ALIASES: MERMAID_ALIASES,
+    SVG_ALIASES: SVG_ALIASES,
+  };
+
+  if (typeof window !== 'undefined' && typeof module === 'undefined') window.DiagramConverters = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})();

@@ -1,0 +1,260 @@
+// 极简静态 dev server：serve src/，供 Tauri dev（devUrl）使用。
+//
+// ADR-4 完整切换的一部分：Tauri v2 未设 devUrl 时 dev/release 共用 frontendDist，
+// 无法按环境分离。设置 devUrl 后 dev 模式加载本 server 提供的 src/ 源码
+// （改完即刷、无需打包），release 仍加载 frontendDist（../dist 打包产物）。
+//
+// 增强（热加载 + 端口自愈）：
+//  - LiveReload：用 SSE（/__livereload，纯 HTTP 流，无需 ws 依赖、无需改 CSP）
+//    监听 src/ 文件变化，自动刷新 webview。比重构前多了真·热加载。
+//  - 端口自愈：若 1420 被「残留的旧 dev-server」占用（上次关应用没杀干净），
+//    自动 taskkill 该进程后重试监听，避免静默连上旧 server 导致「跑旧代码」。
+//
+// 用法：tauri.conf.json build.beforeDevCommand = "node scripts/dev-server.mjs"
+// 端口：PORT 环境变量可覆盖，默认 1420（Tauri 官方模板惯例）。
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..', 'src');
+const PORT = Number(process.env.PORT || 1420);
+const LIVERELOAD_PATH = '/__livereload';
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.md': 'text/markdown; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.webp': 'image/webp',
+};
+
+// ---- LiveReload：SSE 客户端集合 + 文件监听 ----
+const sseClients = new Set();
+let reloadTimer = null;
+function broadcastReload() {
+  for (const res of sseClients) {
+    try { res.write('data: reload\n\n'); } catch { /* 已断开，下次清理 */ }
+  }
+}
+
+// 渲染器是预打包 bundle（src/lib/unified-bundle.js），dev/webview 实际加载的是它，
+// 不是 src/unified-renderer.js 源码。因此源码改动后必须「重新打包」才能让热加载生效——
+// 否则刷新后还是旧 bundle（这正是之前「改渲染器不动」的根因）。这里在 watcher 里
+// 自动重打包，开发期改源码即热更新，无需手动 npm run build:renderer。
+const RENDERER_ENTRY = path.join(ROOT, 'unified-renderer.js');
+const BUNDLE_OUT = path.join(ROOT, 'lib', 'unified-bundle.js');
+const isRendererSource = (f) => /[\\/]unified-renderer\.js$/.test(f);
+const isBundle = (f) => /[\\/]unified-bundle\.js$/.test(f);
+
+async function rebuildRendererBundle(reason) {
+  try {
+    await build({
+      entryPoints: [RENDERER_ENTRY],
+      outfile: BUNDLE_OUT,
+      bundle: true,
+      format: 'iife',
+      globalName: 'UnifiedRenderer',
+      platform: 'browser',
+      target: ['es2020'],
+      legalComments: 'none',
+      logLevel: 'silent',
+    });
+    console.log('[dev-server] 渲染器已重打包（' + reason + '）→ 即将热更新');
+  } catch (e) {
+    console.error('[dev-server] 渲染器打包失败：', e && e.message);
+  }
+}
+
+let pendingExtra = null;
+function scheduleReload(extra) {
+  if (extra) pendingExtra = extra;
+  if (reloadTimer) return; // 合并编辑器连写
+  reloadTimer = setTimeout(async () => {
+    reloadTimer = null;
+    if (pendingExtra) {
+      try { await pendingExtra(); } catch (_) { /* 失败已记录，仍刷新以免卡死 */ }
+      pendingExtra = null;
+    }
+    broadcastReload();
+  }, 60);
+}
+// 只监听真正参与页面渲染的源文件类型，避免日志/临时/二进制文件被 fs.watch 误判触发刷新。
+// 之前偶发自动刷新，多半是外部进程（杀软扫描、编辑器后台写）碰了一下 src/ 下的非源码文件。
+const WATCH_EXT = new Set(['.html', '.js', '.mjs', '.css', '.json', '.md']);
+function shouldWatch(filename) {
+  if (!filename) return false;
+  if (/(^|[\\/])\.|~$/.test(filename)) return false; // 跳过隐藏/临时文件
+  if (isBundle(filename)) return false; // 忽略我们自己产出的 bundle
+  if (isRendererSource(filename)) return true; // 渲染器源码单独处理
+  const ext = path.extname(filename).toLowerCase();
+  return WATCH_EXT.has(ext); // 仅白名单扩展名才触发刷新
+}
+try {
+  fs.watch(ROOT, { recursive: true }, (event, filename) => {
+    if (!shouldWatch(filename)) return;
+    // 诊断日志：偶发刷新时可在终端直接看到「是哪个文件触发的」，便于定位误触发来源
+    console.log(`[dev-server] 文件变化触发刷新: ${event} ${filename}`);
+    if (isRendererSource(filename)) {
+      // 渲染器源码改动：先重新打包 bundle，再热加载 webview
+      scheduleReload(() => rebuildRendererBundle(filename));
+    } else {
+      scheduleReload();
+    }
+  });
+} catch (e) {
+  console.error('[dev-server] 文件监听失败（热加载将不可用）：', e && e.message);
+}
+// 心跳保活（防止中间层超时断开 SSE）
+setInterval(() => { for (const res of sseClients) { try { res.write(': ping\n\n'); } catch {} } }, 15000);
+
+// LiveReload 客户端：原生 EventSource 在长会话里 SSE 断开后不会自动重连（旧实现把
+// es.onerror 静默吞掉），导致后续文件改动不再触发刷新、热加载"失灵"。这里主动接管重连：
+// onerror 时指数退避重建连接；重连仅重建连接、不再自动 location.reload()——否则 SSE 瞬断
+// 重连会反复整页刷新（输入触发预览重渲染、主线程繁忙饿死心跳时尤其明显）。只有服务端主动
+// 推送 data: reload（真实文件改动）时才刷新。
+const LIVERELOAD_SNIPPET = `<script>(function(){
+  try {
+    var path = '${LIVERELOAD_PATH}';
+    var hadOpen = false;       // 是否曾经成功连接过（区分首次打开与重连）
+    var es = null;
+    var failed = 0;            // 连续失败次数，用于指数退避
+    var reconnectTimer = null;
+
+    function connect() {
+      if (es) { try { es.close(); } catch (e) {} }
+      es = new EventSource(path);
+      es.onopen = function () {
+        hadOpen = true;
+        failed = 0; // 连接健康，复位退避计数
+      };
+      es.onmessage = function () { location.reload(); };
+      es.onerror = function () {
+        if (es) { try { es.close(); } catch (e) {} es = null; }
+        if (reconnectTimer) return;
+        failed++;
+        var delay = Math.min(30000, 1000 * Math.pow(2, failed - 1)); // 1s→2s→4s…封顶 30s
+        reconnectTimer = setTimeout(function () {
+          reconnectTimer = null;
+          connect();
+        }, delay);
+      };
+    }
+    connect();
+  } catch (e) {}
+})();</script>`;
+
+const server = http.createServer((req, res) => {
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(new URL(req.url || '/', 'http://localhost').pathname);
+  } catch (_) {
+    res.writeHead(400);
+    res.end('bad request');
+    return;
+  }
+
+  // LiveReload SSE 端点（虚拟路由，不参与文件遍历守卫）
+  if (urlPath === LIVERELOAD_PATH) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Connection': 'keep-alive',
+    });
+    res.write('retry: 1000\n\n');
+    sseClients.add(res);
+    req.on('close', () => sseClients.delete(res));
+    return;
+  }
+
+  if (urlPath === '/') urlPath = '/index.html';
+
+  const file = path.normalize(path.join(ROOT, urlPath));
+  // 防目录穿越：归一化后必须仍在 src/ 内
+  if (!file.startsWith(ROOT + path.sep) && file !== ROOT) {
+    res.writeHead(403);
+    res.end('forbidden');
+    return;
+  }
+  fs.readFile(file, (err, data) => {
+    if (err) {
+      res.writeHead(404);
+      res.end('not found: ' + urlPath);
+      return;
+    }
+    const ext = path.extname(file).toLowerCase();
+    // HTML：注入 LiveReload 客户端（src/index.html 本身保持生产干净，仅 dev 注入）
+    if (ext === '.html') {
+      let html = data.toString('utf8');
+      if (html.includes('</head>')) html = html.replace('</head>', LIVERELOAD_SNIPPET + '</head>');
+      else if (html.includes('</body>')) html = html.replace('</body>', LIVERELOAD_SNIPPET + '</body>');
+      else html += LIVERELOAD_SNIPPET;
+      res.writeHead(200, {
+        'Content-Type': MIME[ext] || 'application/octet-stream',
+        'Cache-Control': 'no-store',
+      });
+      res.end(Buffer.from(html, 'utf8'));
+      return;
+    }
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': 'no-store',
+    });
+    res.end(data);
+  });
+});
+
+// 端口自愈：残留旧 dev-server 占住 1420 时自动清理并重试，避免静默连旧代码
+function getPortOwnerCmd(port) {
+  try {
+    const net = spawnSync('netstat', ['-ano'], { encoding: 'utf8' }).stdout || '';
+    const line = net.split(/\r?\n/).find((l) => l.includes(`:${port}`) && l.includes('LISTENING'));
+    if (!line) return null;
+    const pid = line.trim().split(/\s+/).pop();
+    if (!pid || !/^\d+$/.test(pid)) return null;
+    const tl = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf8' }).stdout || '';
+    const name = (tl.split(',')[0] || '').replace(/^"|"$/g, '') || 'unknown';
+    const wmic = spawnSync('wmic', ['process', 'where', `ProcessId=${pid}`, 'get', 'CommandLine', '/VALUE'], { encoding: 'utf8' }).stdout || '';
+    const cmd = (wmic.split('CommandLine=')[1] || '').trim();
+    return { pid, name, cmd };
+  } catch (_) {
+    return null;
+  }
+}
+
+let listenRetries = 0;
+function start() {
+  server.listen(PORT, () => {
+    console.log(`[dev-server] serving ${ROOT} at http://localhost:${PORT}  (LiveReload: SSE ${LIVERELOAD_PATH})`);
+  });
+}
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE' && listenRetries < 1) {
+    const owner = getPortOwnerCmd(PORT);
+    if (owner && /dev-server\.mjs/.test(owner.cmd || '')) {
+      listenRetries++;
+      console.error(`[dev-server] 端口 ${PORT} 被残留的旧 dev-server 占用（PID ${owner.pid}），自动清理后重试...`);
+      spawnSync('taskkill', ['/F', '/PID', String(owner.pid)], { stdio: 'ignore' });
+      setTimeout(start, 1000);
+    } else {
+      console.error(`[dev-server] 端口 ${PORT} 被占用（${owner ? owner.name + ' PID ' + owner.pid : 'unknown'}），且非本 dev-server，无法自动清理。`);
+      console.error(`[dev-server] 请手动结束占用进程后重试：` + (owner ? ` taskkill /F /PID ${owner.pid}` : ''));
+      process.exit(1);
+    }
+  } else {
+    console.error('[dev-server] 启动失败：', err && err.message);
+    process.exit(1);
+  }
+});
+start();

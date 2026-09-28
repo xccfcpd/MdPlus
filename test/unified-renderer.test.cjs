@@ -1,0 +1,545 @@
+// 回归测试：不成对定界符（$）吞内容 + 孤立 == 高亮丢字符。
+// 覆盖 guardMathBlocks 行内/块级分支的 !foundEnd 回退，以及 convertHighlights 的 == 回退。
+const test = require('node:test');
+const assert = require('node:assert');
+const { renderMarkdown } = require('../src/unified-renderer.js');
+
+test('不成对 $ 在表格中不吞内容（用户复现）', async () => {
+  const md = [
+    '## 测试',
+    '',
+    '| 项目 | 费用 |',
+    '| ---- | ---- |',
+    '| 配额 | $12/5h 窗口 |',
+    '| 单价 | $0.00038/次 |',
+    '',
+    '正文里有金额 $12/5h 和 $0.00038/次',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 表格仍正常渲染
+  assert.ok(html.includes('<table'), '应渲染为 <table>');
+  assert.ok((html.match(/<td/g) || []).length === 4, '应有 4 个单元格，不错位');
+  // 金额以普通文本原样出现，未被包进 MATHBLOCK 占位符
+  assert.ok(html.includes('$12/5h 窗口'), '表格单元格金额应原样显示');
+  assert.ok(html.includes('$0.00038/次'), '表格单元格金额应原样显示');
+  assert.ok(html.includes('正文里有金额 $12/5h 和 $0.00038/次'), '正文金额应原样显示');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成任何 MATHBLOCK（无成对公式）');
+});
+
+test('不成对 $ 不跨表格单元格配对（用户复现 v2）', async () => {
+  // 同一行两个不成对 $（不同单元格）不应被当一条公式吞掉中间内容
+  const md = [
+    '## 测试',
+    '',
+    '| 项目 | 费用 |',
+    '| ---- | ---- |',
+    '| 配额 | $12/5h 窗口 |',
+    '| 单价 | $0.00038/次 |',
+    '',
+    '正文里有金额 $$12/5h 和 $$0.00038/次 也会被吞。',
+    '',
+    '$$ 234322 $$',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<table'), '应渲染为 <table>');
+  assert.strictEqual((html.match(/<td/g) || []).length, 4, '应有 4 个单元格，不错位');
+  assert.ok(html.includes('$12/5h 窗口'), '表格金额应原样显示');
+  assert.ok(html.includes('$0.00038/次'), '表格金额应原样显示');
+  assert.ok(html.includes('$$12/5h 和 $$0.00038/次'), '正文内联 $$ 应原样显示（不当公式）');
+  assert.ok(html.includes('$$ 234322 $$'), '成对 $$...$$ 应保留供 KaTeX 渲染');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成行内 MATHBLOCK');
+  assert.ok((html.match(/math-display/g) || []).length === 1, '仅 $$ 234322 $$ 一个块级公式');
+});
+
+test('行内 $$ 当字面量，不跨段配对', async () => {
+  // 行内的 $$ 不应作为块级公式，也不应与后续 $$ 跨段配对
+  const html = renderMarkdown('正文里有金额 $$12/5h 和 $$0.00038/次', { softBreaks: false });
+  assert.ok(html.includes('$$12/5h 和 $$0.00038/次'), '行内 $$ 应原样显示');
+  assert.ok(!html.includes('math-display'), '行内 $$ 不应生成块级公式占位');
+  assert.ok(!html.includes('MATHBLOCK'), '行内 $$ 不应生成行内占占位');
+});
+
+test('成对 $...$ 跨单元格不被配对', async () => {
+  // 两个单元格各一个 $ 不应拼成一条公式
+  const md = '| a | b |\n| - | - |\n| $x | y$ |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('$x'), '第一格 $ 原样显示');
+  assert.ok(html.includes('y$'), '第二格 $ 原样显示');
+  assert.ok(!html.includes('MATHBLOCK'), '跨单元格不成对，不生成占位符');
+});
+
+test('成对 $...$ 还原为转义文本（KaTeX 在 DOM 阶段渲染）', async () => {
+  const html = renderMarkdown('行内 $a+b$ 公式', { softBreaks: false });
+  // restoreMathBlocks 会把占位符替换回转义后的纯文本，KaTeX 在浏览器里渲染
+  assert.ok(html.includes('$a+b$'), '成对 $...$ 应还原为字面量文本（供后续 KaTeX 渲染）');
+  assert.ok(html.includes('公式'), '后续文字不应被吞');
+});
+
+test('成对 $$...$$ 还原为块级 math-display', async () => {
+  const html = renderMarkdown('$$c^2$$', { softBreaks: false });
+  assert.ok(html.includes('math-display'), '成对 $$...$$ 应生成 math-display 占位');
+});
+
+test('孤立不成对 $ 原样显示不吞后续', async () => {
+  const html = renderMarkdown('价格 $100 起，详见下文', { softBreaks: false });
+  assert.ok(html.includes('$100'), '孤立 $ 应原样显示');
+  assert.ok(html.includes('详见下文'), '后续内容不应被吞掉');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成 MATHBLOCK');
+});
+
+test('行内 $...$ 含 | > ｜ 原样保留供 KaTeX 渲染', async () => {
+  const decodeHtml = (s) => s.replace(/&gt;/g, '>').replace(/&lt;/g, '<').replace(/&amp;/g, '&');
+  for (const expr of ['$x=x_{a+1|a}$', '$x>0$', '$x｜y$']) {
+    const html = renderMarkdown(expr, { softBreaks: false });
+    assert.ok(decodeHtml(html).includes(expr), `${expr} 应原样保留在输出中供 KaTeX 渲染`);
+    assert.ok(!html.includes('katex-ignore'), `${expr} 不应被 katex-ignore 跳过`);
+  }
+});
+
+test('代码块/反引号内 $ 不处理', async () => {
+  const md = [
+    '```',
+    '$a+b$',
+    '```',
+    '',
+    '行内 `$c+d$` 示例',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('$a+b$'), '代码块内 $ 应原样保留');
+  assert.ok(html.includes('$c+d$'), '反引号内 $ 应原样保留');
+  assert.ok(!html.includes('MATHBLOCK'), '代码块/反引号内不应生成 MATHBLOCK');
+});
+
+test('$ 后接空格不触发公式', async () => {
+  const html = renderMarkdown('金额 $ 100 起', { softBreaks: false });
+  assert.ok(html.includes('$ 100'), '$ 空格后 应原样显示');
+});
+
+test('孤立 == 原样显示不丢字符（方案 B）', async () => {
+  const html = renderMarkdown('x == y 表示相等', { softBreaks: false });
+  assert.ok(html.includes('x == y 表示相等'), '孤立 == 应原样显示，不丢 =');
+  assert.ok(!html.includes('<mark>'), '孤立 == 不应生成 <mark>');
+});
+
+test('成对 ==x== 仍高亮', async () => {
+  const html = renderMarkdown('这是 ==重点== 内容', { softBreaks: false });
+  assert.ok(html.includes('<mark>重点</mark>'), '成对 == 应高亮');
+});
+
+test('关闭扩展语法后 ==x== 不渲染高亮', async () => {
+  const html = renderMarkdown('这是 ==重点== 内容', { softBreaks: false, extendedSyntax: false });
+  assert.ok(!html.includes('<mark>'), 'extendedSyntax=false 时不应生成 <mark>');
+  assert.ok(html.includes('==重点=='), 'extendedSyntax=false 时 ==重点== 应原样显示');
+});
+
+test('默认（未传 extendedSyntax）==x== 仍高亮', async () => {
+  const html = renderMarkdown('这是 ==重点== 内容', { softBreaks: false });
+  assert.ok(html.includes('<mark>重点</mark>'), '未传 extendedSyntax 时默认高亮，保持向后兼容');
+});
+
+test('代码块内 == 不被高亮', async () => {
+  const md = [
+    '```js',
+    'if (a == b) {}',
+    '```',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('a == b'), '代码块内 == 应原样保留');
+  assert.ok(!html.includes('<mark>'), '代码块内 == 不应高亮');
+});
+
+test('blockquote 内 lazy continuation 表格渲染为 HTML <table>', async () => {
+  const md = [
+    '> 引用内容',
+    '| 列1 | 列2 |',
+    '| --- | --- |',
+    '| 数据1 | 数据2 |',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('blockquote'), '应包含 blockquote');
+  assert.ok(html.includes('<table>'), '应包含 table');
+  const bqEnd = html.indexOf('</blockquote>');
+  const tableStart = html.indexOf('<table>');
+  assert.ok(tableStart < bqEnd, 'table 应在 blockquote 内');
+  assert.ok(html.includes('数据1'), '表格数据应渲染');
+});
+
+test('无序列表内 lazy continuation 表格渲染为 HTML <table>', async () => {
+  const md = '- 列表项\n| A | B |\n| --- | --- |\n| 1 | 2 |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<ul '), '应包含 ul');
+  assert.ok(html.includes('<table'), '应包含 table');
+  assert.ok(html.includes('</li>'), '应包含 li 闭合');
+});
+
+test('有序列表内 lazy continuation 表格渲染为 HTML <table>', async () => {
+  const md = '1. 列表项\n| A | B |\n| --- | --- |\n| 1 | 2 |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<ol '), '应包含 ol');
+  assert.ok(html.includes('<table'), '应包含 table');
+});
+
+test('任务列表内 lazy continuation 表格渲染为 HTML <table>', async () => {
+  const md = '- [x] 已完成\n| A | B |\n| --- | --- |\n| 1 | 2 |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<input'), '应包含 checkbox');
+  assert.ok(html.includes('<table>'), '应包含 table');
+});
+
+test('空行隔开时表格不视为 lazy continuation', async () => {
+  const md = '> 引用内容\n\n| A | B |\n| --- | --- |\n| 1 | 2 |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('blockquote'), '应包含 blockquote');
+  assert.ok(html.includes('<table'), '应包含 table');
+  const bqEnd = html.indexOf('</blockquote>');
+  const tableStart = html.indexOf('<table');
+  assert.ok(bqEnd < tableStart, '空行隔开时 table 应在 blockquote 外');
+});
+
+test('容器内表格单元格内联 Markdown 被渲染', async () => {
+  const md = [
+    '> 引用',
+    '| **粗体** | `代码` | *斜体* |',
+    '| -------- | ------ | ------ |',
+    '| ~~删~~ | [链接](/) | 普通 |',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<strong>粗体</strong>'), '** 应渲染为 strong');
+  assert.ok(html.includes('<code>代码</code>'), '` 应渲染为 code');
+  assert.ok(html.includes('<em>斜体</em>'), '* 应渲染为 em');
+  assert.ok(html.includes('<del>删</del>'), '~~ 应渲染为 del');
+  assert.ok(html.includes('<a href="/">链接</a>'), '[]() 应渲染为链接');
+});
+
+// ---- 内联 style 安全放开（2026-07-26）：保留合法样式，剥离危险 CSS ----
+test('内联 style 合法声明被保留（日期卡片可渲染）', async () => {
+  const md = `<div style="display: flex; justify-content: space-between; background-color: #f8f9fa; padding: 15px 20px; border-radius: 12px; margin-bottom: 30px; font-weight: 600; color: #2c3e50; border: 1px solid #e9ecef;">
+    <span style="font-size: 1.2rem;">7月22日</span>
+    <span style="color: #6c757d;">星期五</span>
+</div>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<div'), 'div 应渲染');
+  assert.ok(html.includes('display: flex'), 'display:flex 应保留');
+  assert.ok(html.includes('justify-content: space-between'), 'justify-content 应保留');
+  assert.ok(html.includes('background-color: #f8f9fa'), 'background-color 应保留');
+  assert.ok(html.includes('font-size: 1.2rem'), 'font-size 应保留');
+  assert.ok(html.includes('color: #6c757d'), 'color 应保留');
+  assert.ok(html.includes('7月22日') && html.includes('星期五'), '文本应保留');
+});
+
+test('内联 style 危险 CSS 逐条剥离，安全声明保留', async () => {
+  const md = `<div style="color:red; display:none; padding:8px; @import 'evil.css'; visibility:hidden; width:exp/* */ression(alert(1)); -moz-binding:url(x.xml);">x</div>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(!/display\s*:\s*none/.test(html), 'display:none 应被剥离');
+  assert.ok(!/visibility\s*:\s*hidden/.test(html), 'visibility:hidden 应被剥离');
+  assert.ok(!/expression\s*\(/i.test(html), 'expression() 应被剥离');
+  assert.ok(!/@import/i.test(html), '@import 应被剥离');
+  assert.ok(!/-moz-binding/i.test(html), '-moz-binding 应被剥离');
+  // 安全声明逐条保留（defense in depth：rehype-sanitize + sanitizeStyleValue 双重过滤）
+  assert.ok(html.includes('color: red'), 'color:red 安全声明应保留');
+  assert.ok(html.includes('padding: 8px'), 'padding 安全声明应保留');
+  assert.ok(html.includes('x'), '正文应保留');
+});
+
+test('内联 style 含 url(javascript:) 时整条属性被丢弃', async () => {
+  // rehype-sanitize 对 url(javascript:) 采取整条 style 丢弃策略（同属性下的安全声明一并移除，属正常安全行为）
+  const md = `<div style="background:url(javascript:alert(1)); color:red;">x</div>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(!/javascript:/i.test(html), 'url(javascript:) 不应出现');
+  assert.ok(!/color:\s*red/i.test(html), '含危险 url 的整条 style 被丢弃');
+  assert.ok(html.includes('x'), '正文应保留');
+});
+
+test('非 div/span 标签的内联 style 也保留', async () => {
+  const md = `<p style="text-align:center; line-height:1.8;">居中段落</p>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<p'), 'p 应渲染');
+  assert.ok(html.includes('text-align: center'), 'text-align 应保留');
+  assert.ok(html.includes('line-height: 1.8'), 'line-height 应保留');
+});
+
+test('事件处理器 on* 仍被剥离', async () => {
+  const md = `<div style="color:red" onclick="alert(1)">x</div>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(!/onclick/i.test(html), 'onclick 应被剥离');
+  assert.ok(html.includes('color: red'), '合法 style 仍保留');
+});
+
+// ===== 引用块内块级公式（blockquote + $$...$$）回归 =====
+
+test('引用块内规范写法 > $$...$$ 渲染为块级公式', async () => {
+  const md = [
+    '> **数学提示**：速率为 $v$，通量分别为',
+    '> $$',
+    '> \\rho v,\\; p+\\rho v^{2}',
+    '> $$',
+    '> 上述通量相等',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('blockquote'), '应保留引用块结构');
+  assert.ok((html.match(/math-display/g) || []).length === 1, '应生成一个块级公式占位');
+  assert.ok(!html.includes('MATHBLOCK'), '不应残留未替换占位符');
+});
+
+test('引用块 lazy continuation 写法不影响下方独立公式和列表', async () => {
+  // 用户复现：> $$ 开头、中间行无 > 前缀（markdown lazy continuation），
+  // 下方还有独立公式和列表——上方公式配对绝不能跨段吞掉下方内容。
+  const md = [
+    '> **数学提示**：若气体速率为 $v$，则通量分别为',
+    '> $$',
+    '\\rho v,\\; p+\\rho v^{2}',
+    '$$',
+    '> 当控制体内没有源时，上述通量相等。',
+    '',
+    '- 32323',
+    '- 322323',
+    '',
+    '$$',
+    '\\rho v,\\; p+\\rho v^{2}',
+    '$$',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  const displays = html.match(/math-display/g) || [];
+  assert.strictEqual(displays.length, 2, '引用块公式 + 下方独立公式各一个块级占位');
+  assert.ok((html.match(/<li/g) || []).length === 2, '列表项不应被公式配对吞掉');
+  assert.ok(html.includes('32323') && html.includes('322323'), '列表内容应保留');
+  assert.ok(!html.includes('MATHBLOCK'), '不应残留未替换占位符');
+});
+
+test('空行隔开的两个独立 $$...$$ 不互相跨段配对', async () => {
+  const md = [
+    '公式一：',
+    '$$',
+    'a^2',
+    '$$',
+    '',
+    '公式二：',
+    '$$',
+    'b^2',
+    '$$',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  const displays = html.match(/math-display/g) || [];
+  assert.strictEqual(displays.length, 2, '两个独立公式各生成一个块级占位');
+  assert.ok(html.includes('公式一') && html.includes('公式二'), '段落文字应保留');
+  assert.ok(!html.includes('MATHBLOCK'), '不应残留未替换占位符');
+});
+
+// ===== 表格单元格内行内公式含 | 不被切断（用户复现）=====
+
+test('表格单元格内成对公式含 | 不切断表格列', async () => {
+  // 用户复现：$p(x_k|z_{1:k-1})$ 中的 | 曾被 markdown-it 当列分隔符切断成两列。
+  // 现在成对公式优先保护，表格保持 4 列、公式完整留在单个 td 内供 DOM 阶段 KaTeX 渲染。
+  const md = [
+    '| 表述 | 出发点 | 过程 | 结果 |',
+    '| --- | --- | --- | --- |',
+    '| **CK 积分** | 整个分布 $p(x_k|z_{1:k-1})$ | 全概率 + 马尔可夫 | 完整预测分布(含 $\\mu$) |',
+    '| **条件期望捷径** | 只用均值 $\\hat{x}_{k|k-1}$ | 直接算 $E[x_k|z_{1:k-1}]$ | 只用均值 |',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<table'), '应渲染为 <table>');
+  assert.strictEqual((html.match(/<td/g) || []).length, 8, '4 列 × 2 行 = 8 个单元格，不错位');
+  assert.ok(html.includes('$p(x_k|z_{1:k-1})$'), '成对公式应完整保留在单个单元格内');
+  assert.ok(html.includes('$\\hat{x}_{k|k-1}$'), '含 | 的下标公式应完整保留');
+  assert.ok(html.includes('$E[x_k|z_{1:k-1}]$'), '含 | 的期望公式应完整保留');
+});
+
+test('跨单元格的孤立 $ 不配对成公式', async () => {
+  // 原有保守规则：$x 与 y$ 分处两个单元格时，不应跨单元格配对成 $x | y$ 吞掉列分隔符
+  const md = '| a | b |\n| - | - |\n| $x | y$ |';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.strictEqual((html.match(/<td/g) || []).length, 2, '数据行 2 个单元格（表头是 th 不计数）');
+  assert.ok(html.includes('$x') && html.includes('y$'), '孤立 $ 各自保留在单元格内');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成跨单元格 MATHBLOCK');
+});
+
+// ===== 原始 HTML 表格内联公式不跨标签配对（用户复现）=====
+
+test('原始 HTML table 单元格内 $...$ 不跨 <td></td> 配对', async () => {
+  // 用户复现：<table><tr><td>$ \varphi_k $</td><td>$ M_b $</td>...</table>
+  // guardMathBlocks 曾把 "$</td><td>$" 误判为行内公式，导致整行单元格被合并、
+  // 后续标签被 escape。修复后每个 $...$ 应留在各自 <td> 内，table 结构完整。
+  const md = `<table border=1><tr><td>$ \\varphi_{k} $</td><td>$ M_{b} $</td><td>$ M_{d} $</td><td>$ M_{c} $</td></tr></table>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<table'), '应保留 <table>');
+  // 4 个数据单元格（无 thead，统一算 td）
+  assert.strictEqual((html.match(/<td/g) || []).length, 4, '应有 4 个 <td>，单元格不错位');
+  assert.ok(html.includes('<td>$ \\varphi_{k} $</td>'), 'φ 公式应留在第一个 td');
+  assert.ok(html.includes('<td>$ M_{b} $</td>'), 'Mb 公式应留在第二个 td');
+  assert.ok(html.includes('<td>$ M_{d} $</td>'), 'Md 公式应留在第三个 td');
+  assert.ok(html.includes('<td>$ M_{c} $</td>'), 'Mc 公式应留在第四个 td');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成跨标签 MATHBLOCK');
+  assert.ok(!html.includes('&lt;/td&gt;'), '不应出现被 escape 的 </td>');
+});
+
+test('原始 HTML table 表头与数据行均含 $...$ 时结构保持', async () => {
+  const md = `<table><tr><th>$ x $</th><th>$ y $</th></tr><tr><td>$ a $</td><td>$ b $</td></tr></table>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.strictEqual((html.match(/<th/g) || []).length, 2, '应有 2 个 th');
+  assert.strictEqual((html.match(/<td/g) || []).length, 2, '应有 2 个 td');
+  assert.ok(html.includes('<th>$ x $</th>') && html.includes('<th>$ y $</th>'), '表头公式保留');
+  assert.ok(html.includes('<td>$ a $</td>') && html.includes('<td>$ b $</td>'), '数据行公式保留');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成 MATHBLOCK');
+});
+
+// ===== 行内 $...$ 前后带空格（用户复现：规范条文公式）=====
+
+test('行内 $...$ 前后带空格且含数学标记时被保护并还原', async () => {
+  // 用户粘贴的规范条文：$ f_{a} $、$ A_{b} $ 等，前后都有空格
+  const md = '式中： $ f_{a} $——由土的抗剪强度指标确定';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('$ f_{a} $'), '带空格的行内公式文本应完整保留');
+  assert.ok(html.includes('——由土的抗剪强度指标确定'), '公式后中文应保留');
+});
+
+test('原始 HTML table 单元格内 $...$（带空格、含数学标记）仍独立渲染且结构完整', async () => {
+  const md = `<table border=1><tr><td>$ \\varphi_{k}(°) $</td><td>$ M_{b} $</td><td>$ M_{d} $</td><td>$ M_{c} $</td></tr></table>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('<table'), '应保留 <table>');
+  assert.strictEqual((html.match(/<td/g) || []).length, 4, '应有 4 个 <td>');
+  assert.ok(html.includes('<td>$ \\varphi_{k}(°) $</td>'), 'φ 公式应留在第一个 td');
+  assert.ok(html.includes('<td>$ M_{b} $</td>'), 'Mb 公式应留在第二个 td');
+  assert.ok(!html.includes('&lt;/td&gt;'), '不应出现被 escape 的 </td>');
+});
+
+test('前后带空格但内容不像数学的 $...$ 保持字面量', async () => {
+  // "$ 100 $" 这种货币/数字文本不应被当成公式
+  const md = '金额 $ 100 起，另 $ 200';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('$ 100'), '孤立 $ 应原样显示');
+  assert.ok(!html.includes('MATHBLOCK'), '不应生成 MATHBLOCK');
+});
+
+test('行内 $...$ 前后带空格且为单字母变量时也被保护并还原', async () => {
+  // 用户复现：规范条文 " $ c $——黏聚力" 中 c 是单字母变量
+  const md = ' $ c $——黏聚力； $ \u03BD $ 泊松比';
+  const html = renderMarkdown(md, { softBreaks: false });
+  assert.ok(html.includes('$ c $'), '单字母变量公式应完整保留');
+  assert.ok(html.includes('$ \u03BD $'), '单希腊字母变量公式应完整保留');
+  assert.ok(html.includes('黏聚力') && html.includes('泊松比'), '公式后中文应保留');
+});
+
+test('行内 $...$ 前后带空格且含比较运算符时被保护并还原', async () => {
+  // 用户复现：图注 "$  (e > b/6)  $" 含 > / ( ) /
+  const md = '<div style="text-align: center;">图 5.2.2 偏心荷载  $  (e > b/6)  $</div>';
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 数学块复原时 > 会被 escapeHtml 转义为 &gt;
+  assert.ok(html.includes('$  (e &gt; b/6)  $'), '带空格比较公式应完整保留');
+  assert.ok(!html.includes('katex-ignore'), '不应被 katex-ignore 跳过');
+});
+
+test('原始 HTML table 单元格内数学含 HTML 实体 &lt; &gt; 时只转义一次', async () => {
+  // 用户复现：规范表格中 $ 24 &lt; H_{{g}} \le 60 $ 被复原为 $ 24 &amp;lt; ... $，
+  // 浏览器看到的是 &lt; 字面量，KaTeX 解析失败显示红色。
+  const md = `<table border=1><tr><td>$ 24 &lt; H_{{g}} \\le 60 $</td><td>$ H_{{g}} &gt; 100 $</td></tr></table>`;
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 应只转义一次：最终 HTML 里实体保持 &lt; / &gt;，不应二次转义为 &amp;lt; / &amp;gt;
+  assert.ok(html.includes('<table'), '应保留 <table>');
+  assert.ok(html.includes('$ 24 &lt; H_{{g}} \\le 60 $'), '应只转义一次 &lt;');
+  assert.ok(html.includes('$ H_{{g}} &gt; 100 $'), '应只转义一次 &gt;');
+  assert.ok(!html.includes('&amp;lt;'), '不应出现 &amp;lt;');
+  assert.ok(!html.includes('&amp;gt;'), '不应出现 &amp;gt;');
+});
+
+test('行内 $...$ 前后带空格且含 ASCII 单引号（素数/导数标记）时被保护并还原', async () => {
+  // 用户复现：表格中 "$ R&#x27; $" 经浏览器解码后 inner 为 "R'"，
+  // 启发式需把 ASCII 单引号视为数学标记，避免被当成文本边界 break。
+  const md = '<table border=1><tr><td>再加荷比  $ R&#x27; $</td></tr></table>';
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 复原后应保持为合法的 HTML 实体 &#x27;，浏览器解码后 KaTeX 看到 R'
+  assert.ok(html.includes('$ R&#x27; $'), "R' 公式应完整保留");
+  assert.ok(!html.includes('katex-ignore'), '不应被 katex-ignore 跳过');
+});
+
+test('HTML 实体按 HTML 标准解码（&nbsp; &amp; &lt; &gt; &copy; 等）', async () => {
+  // 内容被原生 HTML 包裹时，实体应交给 HTML 解析器解码，不应残留命名实体字面量。
+  const md = '<div>与 &amp; 或 &lt;b&gt; 及 &copy; 2026 &nbsp;尾</div>';
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 命名实体应被解码，不应残留字面量
+  assert.ok(!html.includes('&amp;'), '不应残留 &amp;');
+  assert.ok(!html.includes('&lt;'), '不应残留 &lt;');
+  assert.ok(!html.includes('&gt;'), '不应残留 &gt;');
+  assert.ok(!html.includes('&copy;'), '不应残留 &copy;');
+  assert.ok(!html.includes('&nbsp;'), '不应残留 &nbsp;');
+  // 解码后的实际字符应出现
+  assert.ok(html.includes('©'), '应解码出 ©');
+  assert.ok(html.includes(' '), '应解码出不换行空格');
+});
+
+test('Word/Excel 命名空间标签与 mso-* 样式被清洗，结构与 class 保留', async () => {
+  // 用户复现：粘入 Word/Excel 导出的 HTML 会带 <o:p>/<w:*> 与 mso-* 样式。
+  const md = '<table class="MsoTableGrid" border="1">'
+    + '<tr><td style="mso-padding:1.0pt; text-align:center">'
+    + '<p class="MsoNormal">中、低压缩性土<o:p></o:p></p></td></tr></table>'
+    + '<w:tbl><w:tr><w:tc>cell</w:tc></w:tr></w:tbl>'
+    + '<div style="mso-element:para; text-align:center">图 1</div>';
+  const html = renderMarkdown(md, { softBreaks: false });
+  // 命名空间标签应被清除
+  assert.ok(!/<o:p/i.test(html), 'o:p 应被清除');
+  assert.ok(!/<w:/i.test(html), 'w: 命名空间标签应被清除');
+  assert.ok(!/mso-/i.test(html), 'mso-* 样式应被清除');
+  // 内部文本 / 结构保留
+  assert.ok(html.includes('中、低压缩性土'), '单元格文本应保留');
+  assert.ok(html.includes('cell'), 'w:tc 内文本应保留');
+  assert.ok(html.includes('图 1'), 'div 文本应保留');
+  // 合法 style 与 class 应保留
+  assert.ok(html.includes('text-align'), '合法 style 应保留');
+  assert.ok(html.includes('MsoTableGrid'), 'class 属性应保留');
+});
+
+
+
+// ===== 回归（2026-09-11）：正文里出现「行内代码中的三个反引号」不得带偏围栏状态机 =====
+
+test('行内代码里的三个反引号不得导致其后数学块失去识别', async () => {
+  // 复现现场：文档里写一句「用 ` ```math ` 围栏」，其中行内代码含 3 个连续反引号。
+  // 修复前 guardMathBlocks 会把它当围栏开始 → inCodeBlock 翻转 → 其后整篇的 $$ 公式
+  // 都不再被包成 .math-display，预览里只剩 $$ 源码（用户复现：整节数学公式不渲染）。
+  const BT = '`';
+  const md = [
+    '说明：写 ' + BT + ' ' + BT + BT + BT + 'math ' + BT + ' 围栏。',
+    '',
+    '$$',
+    'a^2 + b^2 = c^2',
+    '$$',
+    '',
+    '再来一个 $x+y$ 行内公式。',
+  ].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+
+  assert.strictEqual(
+    (html.match(/class="math-display"/g) || []).length,
+    1,
+    '块级 $$ 必须被识别并包成 .math-display（否则预览只剩源码）',
+  );
+  assert.ok(html.includes('$x+y$'), '其后的行内公式应保留给 KaTeX 渲染');
+  assert.ok(html.includes('math-placeholder') === false, '占位符应已全部还原');
+});
+
+test('真围栏内的 $ 仍被跳过，围栏之后的 $$ 仍被识别（修复不得放宽围栏识别）', async () => {
+  const md = ['```js', 'const p = 1; // $x$ 不是公式', '```', '', '$$a^2$$'].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+
+  assert.ok(html.includes('<code'), '围栏应正常渲染为代码块');
+  assert.ok(html.includes('$x$'), '围栏内的 $ 应原样留在代码块中');
+  assert.strictEqual(
+    (html.match(/class="math-display"/g) || []).length,
+    1,
+    '只应识别围栏之后的那一个块级公式',
+  );
+});
+
+test('引用块内的围栏仍被识别（修复不得误伤 > ``` 写法）', async () => {
+  // 回归护栏：上面那条"围栏必须在行首"的修复若写得太严，会把引用块里的
+  // "> ```shell" 误判为非围栏 → 引用块内的 $ 被当公式处理。此处锁死该行为。
+  const md = ['> ```shell', '> echo "$HOME"   # 这里的 $ 不应变成公式', '> ```', '', '$$e^2$$'].join('\n');
+  const html = renderMarkdown(md, { softBreaks: false });
+
+  assert.ok(html.includes('<blockquote'), '引用块应正常渲染');
+  assert.ok(html.includes('$HOME'), '引用块内代码里的 $ 应原样保留');
+  assert.strictEqual(
+    (html.match(/class="math-display"/g) || []).length,
+    1,
+    '只应识别引用块之后的那一个块级公式',
+  );
+});
