@@ -338,19 +338,18 @@
         let target = aP + t * (bP - aP);
         const vMax = Math.max(0, scrollHeight - clientHeight);
 
-        // ── 末尾区段：最后一屏内由「顶部对齐」平滑过渡到「底部对齐」──────────────
-        // 为什么必须过渡：预览内容比编辑器矮（行高不同）⇒ 顶部对齐的映射会先于编辑器触底
-        //   就达到预览可滚上限；此时「连续 + 单调 + 不越界 + 精确遵守锚点」四者不可兼得，
-        //   硬夹（scrollTop = vMax）是该约束下的唯一解 —— 代价是最后约一屏内容永远对不上
+        // ── 末尾区段：顶部对齐越界时，平滑过渡到「底部对齐」──────────────────
+        // 为什么需要：预览内容比编辑器矮（行高不同）⇒ 顶部对齐的映射会先于编辑器触底就
+        //   越过预览可滚上限；此时「连续 + 单调 + 不越界 + 精确遵守锚点」四者不可兼得，
+        //   硬夹（scrollTop = vMax）是该约束下的唯一解，代价是最后一屏内容永远对不上
         //   （实测偏差 ≈ −clientHeight，即"编辑器还有一屏、预览已贴底"）。
-        //   这里改为在尾部改用「底部对齐」：让编辑器视口底行与预览视口底行对应 ——
-        //   底部必然对齐，顶部残差降到两栏"每屏行数差"这一固有量级（≈ 0.25 屏）。
-        // 权重 w 由编辑器「剩余可滚动距离」给出，保证：
-        //   · 离底部还有一屏时 w=0 → **与旧行为逐位相同**（中前段零改动）；
-        //   · 编辑器到底时 w=1 → bTarget 恰为 vMax（与上方"编辑器到底"早返回一致，无跳变）。
-        const distToBottom = cmInfo.height - (top + clientHeight);
-        if (distToBottom < clientHeight) {
-          const w = 1 - Math.max(0, distToBottom) / Math.max(1, clientHeight);
+        //   这里改用「底部对齐」（编辑器视口底行 ↔ 预览视口底行）：底部必然对齐，顶部残差
+        //   降到两栏"每屏行数差"这一固有量级（≈0.25 屏）。
+        // ⚠ 判据必须是「顶部对齐已越界」（target > vMax），**不能**写成"编辑器距底不足一屏"：
+        //   预览比编辑器高的文档里，后者会把本来完全可达的顶部对齐也一起改掉（CI 实测踩过）。
+        // 权重 w 由越界量给出：刚越界时 w=0（与旧行为连续），越界满一屏时 w=1。
+        if (target > vMax + 0.5) {
+          const w = Math.min(1, (target - vMax) / Math.max(1, clientHeight));
           const bottomLine = this.cm.lineAtHeight(top + clientHeight, 'local') + 1;
           const pb = this._anchorPairByLine(bottomLine);
           let bTarget = target;
