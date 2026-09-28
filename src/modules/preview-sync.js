@@ -205,16 +205,15 @@
         if (deduped[deduped.length - 1].line < totalLines - 1) deduped.push({ line: totalLines - 1, fraction: 1 });
         this._linePositions = deduped;
       },
-      // 元素在「预览内容坐标系」中的纵向像素位置（与 preview.scrollTop 同基准）。
-      // 与 rebuildScrollSync 里 _linePositions 的算法统一（rect 相减 + scrollTop）。
-      // ⚠ 不要改回 offsetParent 遍历：`.preview-content`（= this.preview）是 position:static，
-      // 它永远不出现在 offsetParent 链里，循环会一路累加到文档根，使每个返回值都多出
-      // 「预览内容顶 → 文档顶」的常量偏移（实测恒为 88px = 顶栏高度），导致滚动同步全程
-      // 恒定偏大 88px（预览比编辑器多滚约 5 行），且编辑器→预览 / 预览→编辑器两个方向同时偏。
+      // demo 的 getHeightToTop：计算元素到容器顶部的距离（offsetTop 遍历 offsetParent）
       _getOffsetTop(el) {
-        const rect = el.getBoundingClientRect();
-        const previewRect = this.preview.getBoundingClientRect();
-        return rect.top - previewRect.top + this.preview.scrollTop;
+        let top = el.offsetTop;
+        let parent = el.offsetParent;
+        while (parent && parent !== this.preview) {
+          top += parent.offsetTop;
+          parent = parent.offsetParent;
+        }
+        return top;
       },
       // demo 风格：节流函数（首次立即执行，后续在 delay 内只保存最后一次调用）
       _throttleScroll(fn, delay) {
