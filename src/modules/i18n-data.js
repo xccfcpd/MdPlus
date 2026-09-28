@@ -260,7 +260,7 @@
       cautionHint: 'Caution 注意',
       importantHint: 'Important 重要',
       version: '版本信息',
-      license: '版权声明',
+      license: '许可协议',
       // 三个"以前从未翻译"的对话框标题（英文界面残留中文 —— 审计发现 2026-09-25）
       eulaDialogTitle: '版权与许可声明',
       docxDialogTitle: '导出 DOCX',
@@ -774,7 +774,7 @@
       cautionHint: 'Caution',
       importantHint: 'Important',
       version: 'Version',
-      license: 'Copyright',
+      license: 'License',
       eulaDialogTitle: 'Copyright & License',
       docxDialogTitle: 'Export DOCX',
       fileSearchDialogTitle: 'File Search',
