@@ -157,6 +157,8 @@
 
         // 预览内容变化：滚动同步位置表作废，下次 _computedPosition 重算（缓存守卫）
         this._positionCacheDirty = true;
+        // 预览重渲染会整体替换 DOM，v2 局部锚定的「锚点元素清单」必须随之重建
+        this._anchorDirty = true;
         // 一次性取出预览中所有 [data-source-line] 元素：位置表与下方的 _linePositions 共用
         // 这一次查询 —— 原先同一次重建对整棵 DOM 查了两遍（2026-09-26）。
         const allElements = Array.from(this.preview.querySelectorAll('[data-source-line]'));
@@ -248,8 +250,123 @@
         this._canScroll.editor = true;
         this._canScroll.preview = true;
       },
-      // 编辑器 → 预览同步（逐行密集插值）
+      // ── v2：局部按需锚定 ────────────────────────────────────────────────
+      // 为什么不再用「全文档逐行位置表」：
+      //   · 表一旦建立就与真实布局脱钩 —— 预览异步变高（图片解码 / 图表落定 / 字体加载）、
+      //     字号缩放、CodeMirror 渐进测量，都会改变高度却**不改变行数**，而失效条件只能靠猜；
+      //     实测出现过表落后 402px 的情形。
+      //   · 表里预览侧用的是「文档基准」坐标，与 preview.scrollTop 的基准不一致，会引入常量偏移。
+      // 现在只缓存**锚点元素清单**（纯结构，随预览重渲染失效），每次同步**现测 2 个锚点**当场插值：
+      //   位置永远新鲜（免疫上述异步变高）、误差只在局部不累积、每次仅 2~3 次 getBoundingClientRect。
+      _anchorIndex() {
+        const cached = this._anchorEls;
+        // isConnected 兜底：预览重渲染会整体替换 DOM，缓存里的元素可能已脱离文档
+        if (!this._anchorDirty && cached && cached.length >= 2 && cached[0].el.isConnected) return cached;
+        const seen = new Set();
+        const els = [];
+        for (const el of this.preview.querySelectorAll('[data-source-line]')) {
+          if (el.closest('.footnotes')) continue;        // 脚注：源码在中部、渲染在底部，不参与映射
+          const line = parseInt(el.dataset.sourceLine, 10);
+          if (isNaN(line) || seen.has(line)) continue;   // 同一源码行只保留 DOM 中最外层的一个
+          seen.add(line);
+          els.push({ line, el });
+        }
+        els.sort((a, b) => a.line - b.line);
+        this._anchorEls = els;
+        this._anchorDirty = false;
+        return els;
+      },
+      // 预览内容坐标系原点：contentTop(el) = el.rect.top - this._previewContentBase()
+      _previewContentBase() {
+        return this.preview.getBoundingClientRect().top - this.preview.scrollTop;
+      },
+      // 按源码行取相邻锚点（结构二分，0 次布局测量）
+      _anchorPairByLine(line) {
+        const els = this._anchorIndex();
+        const n = els.length;
+        if (n < 2) return null;
+        let lo = 0, hi = n - 1, idx = -1;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (els[mid].line <= line) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+        }
+        if (idx < 0) idx = 0;
+        if (idx > n - 2) idx = n - 2;
+        return [els[idx], els[idx + 1]];
+      },
+      // 按预览内容位置取相邻锚点（现测二分：O(log N) 次测量，而非全量建表）
+      _anchorPairByPreviewPos(y) {
+        const els = this._anchorIndex();
+        const n = els.length;
+        if (n < 2) return null;
+        const base = this._previewContentBase();
+        let lo = 0, hi = n - 1, idx = 0;
+        while (lo <= hi) {
+          const mid = (lo + hi) >> 1;
+          if (els[mid].el.getBoundingClientRect().top - base <= y) { idx = mid; lo = mid + 1; }
+          else hi = mid - 1;
+        }
+        if (idx > n - 2) idx = n - 2;
+        return [els[idx], els[idx + 1]];
+      },
+      // 编辑器 → 预览：按源码行局部插值。返回 true 表示已处理（false 则交回旧实现兜底）。
+      _syncEditorToPreviewLocal(editorTop) {
+        const cmInfo = this.cm.getScrollInfo();
+        const { scrollHeight, clientHeight } = this.preview;
+        const top = (editorTop != null) ? editorTop : cmInfo.top;
+
+        if (top <= 0.5) { this.preview.scrollTop = 0; return true; }
+        if (top + clientHeight >= cmInfo.height - 0.5) {
+          this.preview.scrollTop = Math.max(0, scrollHeight - clientHeight);
+          return true;
+        }
+        const line = this.cm.lineAtHeight(top, 'local') + 1;   // 1-based 源码行
+        const pair = this._anchorPairByLine(line);
+        if (!pair) return false;                               // 锚点不足：交回旧实现
+
+        const base = this._previewContentBase();
+        const aE = this.cm.heightAtLine(pair[0].line - 1, 'local');
+        const bE = this.cm.heightAtLine(pair[1].line - 1, 'local');
+        const aP = pair[0].el.getBoundingClientRect().top - base;
+        const bP = pair[1].el.getBoundingClientRect().top - base;
+
+        const eSpan = bE - aE;
+        let t = eSpan > 0 ? (top - aE) / eSpan : 0;
+        if (!(t >= 0)) t = 0; else if (t > 1) t = 1;           // 夹取：防 NaN / 越界外推
+        const target = aP + t * (bP - aP);
+        this.preview.scrollTop = Math.max(0, Math.min(target, scrollHeight - clientHeight));
+        return true;
+      },
+      // 预览 → 编辑器：按内容位置局部插值。返回 true 表示已处理。
+      _syncPreviewToEditorLocal(previewTop) {
+        const cmInfo = this.cm.getScrollInfo();
+        const { scrollHeight, clientHeight } = this.preview;
+        const pvTop = (previewTop != null) ? previewTop : this.preview.scrollTop;
+
+        if (pvTop <= 0.5) { this.cm.scrollTo(0, 0); return true; }
+        if (pvTop + clientHeight >= scrollHeight - 0.5) {
+          this.cm.scrollTo(0, Math.max(0, cmInfo.height - cmInfo.clientHeight));
+          return true;
+        }
+        const pair = this._anchorPairByPreviewPos(pvTop);
+        if (!pair) return false;
+
+        const base = this._previewContentBase();
+        const aP = pair[0].el.getBoundingClientRect().top - base;
+        const bP = pair[1].el.getBoundingClientRect().top - base;
+
+        const pSpan = bP - aP;
+        let t = pSpan > 0 ? (pvTop - aP) / pSpan : 0;
+        if (!(t >= 0)) t = 0; else if (t > 1) t = 1;
+        const aE = this.cm.heightAtLine(pair[0].line - 1, 'local');
+        const bE = this.cm.heightAtLine(pair[1].line - 1, 'local');
+        this.cm.scrollTo(0, aE + t * (bE - aE));
+        return true;
+      },
+      // 编辑器 → 预览同步（旧路径：全文档位置表 + 逐行插值）
+      // v2 局部锚定可用时由 _syncEditorToPreviewLocal 短路接管，这里只作锚点不足时的兜底。
       _syncEditorToPreview(editorTop) {
+        if (this._syncEditorToPreviewLocal(editorTop)) return;
         if (this.previewWindow) { this._syncEditorToPreviewWindow(); return; }
         this._computedPosition();
   
@@ -297,6 +414,7 @@
       // previewTop 可选：指定预览滚动位置作为来源；省略则读当前预览 scrollTop。
       // 切换模式时用它传入「已保存的预览位置」，避免依赖此刻可能不可靠的实时值。
       _syncPreviewToEditor(previewTop) {
+        if (this._syncPreviewToEditorLocal(previewTop)) return;   // v2：局部按需锚定
         if (this.previewWindow) { this._syncPreviewToEditorWindow(); return; }
         this._computedPosition();
   
