@@ -206,6 +206,8 @@
         if (deduped.length === 0 || deduped[0].line > 0) deduped.unshift({ line: 0, fraction: 0 });
         if (deduped[deduped.length - 1].line < totalLines - 1) deduped.push({ line: totalLines - 1, fraction: 1 });
         this._linePositions = deduped;
+        // v2 配套：图片解码 / 图表落定 / 字体加载可能在本帧之后才改高度 → 观察并在变化后重同步
+        this._watchPreviewSettle();
       },
       // demo 的 getHeightToTop：计算元素到容器顶部的距离（offsetTop 遍历 offsetParent）
       _getOffsetTop(el) {
@@ -362,6 +364,52 @@
         const bE = this.cm.heightAtLine(pair[1].line - 1, 'local');
         this.cm.scrollTo(0, aE + t * (bE - aE));
         return true;
+      },
+      // ── v2 配套：异步内容落定后重同步 ────────────────────────────────────
+      // 为什么还需要它：局部锚定每次同步都现测锚点，所以「表过期」已不存在；但**两次同步之间**
+      //   预览内容仍可能变高（<img> 解码完成、ECharts/Markmap 落定、字体加载），
+      //   此时 preview.scrollTop 没变、显示的内容却变了 → 观感就是"慢慢错开"。
+      // 做法（全 JS，不动 CSS、不改任何尺寸）：
+      //   ① 监听预览内 <img> 的 load（load 事件不冒泡，必须用捕获）；
+      //   ② 渲染后短暂观察 scrollHeight，一旦变化就防抖重同步一次。
+      _watchPreviewSettle() {
+        // 无真实布局（jsdom：scrollHeight 恒为 0）直接返回，避免在测试里留下定时器
+        if (!this.preview || !this.preview.scrollHeight) return;
+
+        if (!this._previewImgLoadBound) {
+          this._previewImgLoadBound = true;
+          this.preview.addEventListener('load', (e) => {
+            if (e.target && e.target.tagName === 'IMG') this._requestPreviewResync();
+          }, true);
+        }
+
+        clearTimeout(this._settleWatchTimer);
+        let lastH = this.preview.scrollHeight;
+        let ticks = 0;
+        const tick = () => {
+          const h = this.preview.scrollHeight;
+          if (Math.abs(h - lastH) > 1) { lastH = h; this._requestPreviewResync(); }
+          if (++ticks < 8) this._settleWatchTimer = setTimeout(tick, 250);   // 最多观察约 2s
+        };
+        this._settleWatchTimer = setTimeout(tick, 250);
+      },
+      // 防抖重同步：只在「不在程序化定位窗口内、同步锁未被占、预览可见」时执行，
+      // 避免与用户滚动或大纲跳转抢方向盘。
+      _requestPreviewResync() {
+        if (this._resyncTimer) return;
+        this._resyncTimer = setTimeout(() => {
+          this._resyncTimer = null;
+          if (Date.now() < (this._scrollSuppressUntil || 0)) return;
+          if (!this._canScroll || !this._canScroll.editor) return;
+          if (this.settings && this.settings.scrollSync === false) return;
+          const container = this._editorContainerEl
+            || (this._editorContainerEl = document.querySelector('.editor-container'));
+          if (!container) return;
+          if (container.classList.contains('preview-collapsed')) return;
+          if (container.classList.contains('preview-mode')) return;
+          if (this.cm.getScrollInfo().top <= 0.5) return;   // 顶部无需校正
+          this._syncEditorToPreview();
+        }, 160);
       },
       // 编辑器 → 预览同步（旧路径：全文档位置表 + 逐行插值）
       // v2 局部锚定可用时由 _syncEditorToPreviewLocal 短路接管，这里只作锚点不足时的兜底。
