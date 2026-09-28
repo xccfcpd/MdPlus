@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main：合并后继续把关。
+    # feat/**：特性分支一推送就跑 —— 否则只有开了 PR 才会验证；而 test/browser/ 的对齐精度
+    # 用例依赖真实排版引擎（本机常常没有 npm/浏览器，跑不了），必须靠 CI 的 browser job 兜底。
+    branches: [main, 'feat/**']
   pull_request:
     branches: [main]
   # 手动触发入口（GitHub UI 的 Run workflow）；需该 workflow 已存在于【默认分支】才显示。
