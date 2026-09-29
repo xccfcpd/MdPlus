@@ -193,6 +193,13 @@ const TauriMock = `
     };
 
     const total = cm.lineCount();
+    // 预热：先走一遍全文，让 CodeMirror 完成行高测量。否则首点 heightAtLine 还是估算值，
+    // scrollTo 会落在第 1 行附近（CI 实测首样本"目标 300 → 实际顶行 1"），样本失去意义。
+    cm.refresh();
+    await sleep(150);
+    cm.scrollTo(0, cm.getScrollInfo().height); await settle(); await sleep(600);
+    cm.scrollTo(0, 0); await settle();
+
     const rows = [];
     for (const f of [0.05, 0.25, 0.5, 0.75, 0.95]) {
       const want = Math.max(1, Math.floor(total * f));
@@ -261,9 +268,16 @@ const TauriMock = `
   const moved = starts.length > 1 && starts[starts.length - 1] > starts[0];
   bump(assert('窗口随滚动移动（start 单调递增且确实变化）', monotone && moved,
     starts.join(' → ')));
-  const badLead = rows.filter((r) => !(r.want - r.win.start >= 0 && r.want - r.win.start <= LEAD_TOL));
-  bump(assert(`窗口起点 ≈ 目标行 − ${LEAD}（容差 ${LEAD_TOL}）`, badLead.length === 0,
-    badLead.length ? `越界：${badLead.map((r) => `${r.want}→${r.win.start}`).join(', ')}`
+  // 窗口起点一般 ≈ 目标行 − PREVIEW_WINDOW_LEAD(200)：焦点行前留 200 行上下文。
+  // **文档尾部例外**：窗口不得越过文档末行，实现会把整窗回推到末尾
+  // （CI 实测：目标行 5700 / 文档 6001 行 → 窗口 4800~6001，正好是末尾 1201 行 ⇒ 合法）。
+  const badLead = rows.filter((r) => {
+    if (r.want - r.win.start < 0) return true;                    // 窗口起点必须在目标行之前
+    if (r.want - r.win.start <= LEAD_TOL) return false;           // 正常：≈ 目标行 − LEAD
+    return !(r.win.end >= res.total - 2);                         // 例外：回推到文档末尾
+  });
+  bump(assert(`窗口起点 ≈ 目标行 − ${LEAD}（容差 ${LEAD_TOL}；文档尾部回推除外）`, badLead.length === 0,
+    badLead.length ? `越界：${badLead.map((r) => `${r.want}→${r.win.start}~${r.win.end}`).join(', ')}`
       : `偏移 ${rows.map((r) => r.want - r.win.start).join(', ')}`));
   bump(assert('窗口内容锚点区间覆盖实际顶行', rows.every((r) => r.coveredByAnchors && r.inWindow),
     rows.map((r) => `${r.coveredByAnchors ? 'ok' : 'X'}${r.inWindow ? 'ok' : 'X'}`).join('')));
