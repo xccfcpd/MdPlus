@@ -6,18 +6,22 @@
  *   **正反映射共用同一张位置表**，偏差会自相消，因此它恒通过：真实存在 88px 常量偏移时
  *   它也报 ok（已实测）。这类"自证式指标"没有证明力。
  *
- * 本用例改用**绝对度量**：把编辑器精确停在某个锚点行的行首，等同步落定后，直接量该锚点的
- *   DOM 顶部到预览视口顶部的像素距离。理想 0px；它与实现内部用哪张表、哪个公式无关。
+ * 本用例改用**绝对度量**，且「基准」与实现同源，避免把取样误差记成产品误差（2026-09-29 重写）：
+ *   · 基准取「落定后**实际**的视口顶行」`lineAtHeight(scrollTop)+1`，**不是**"我打算滚到的行"
+ *     —— `scrollTo(heightAtLine(L-1))` 对离屏行用的是估算行高，落点常差 1~2 行；按"打算的行"
+ *     取元素会凭空多出 1~2 行（实测：曾把正确实现量成恒定 −86px / −709px 的假失败）；
+ *   · 被测元素取「**≤ 实际顶行的最大锚点行**」（与 `_anchorPairByLine` 同源）；
+ *   · 由此得到局部「跨度」= 该锚点 → 下一个锚点的预览像素距离，`t = |err| / 跨度`。
  *
- * 因此本用例的作用是**给滚动同步立一道可回归的门槛**：
- *   · 任何"预览恒定多滚/少滚一个常量"的实现都会在这里露出来
- *     （实测：旧实现稳定 −88px；改用局部按需锚定后中位 3px）；
- *   · 门槛取 max ≤ 48px、中位 ≤ 16px —— 远小于历史 88px 常量偏移，又容得下插值残差；
- *   · **预览已贴底（scrollTop 达上限）的样本不计入门槛**：该区段顶部对齐数学上不可达
- *     （预览可滚范围比编辑器短，硬夹是唯一连续解），量它没有意义；同时要求未贴底样本
- *     ≥ 5 个，防止"全靠贴底样本"把门槛架空；
- *   · 取样基准是「落定后**实际**的视口顶行」，并用与实现同源的方式取该行元素 —— 否则
- *     行边界的取整差会让测量落到相邻整块上（曾表现为恒定 −86px 的假失败）。
+ * 门槛（全部建立在上述绝对度量上，不调用实现内部映射函数）：
+ *   · **t ≤ 1**：实现按设计把预览定位在锚点括号之内；任何常量偏移都会在**小跨度**样本上
+ *     越界（历史 −88px 常量偏移在跨度 40~88px 的样本上必然失败）；
+ *   · **无常量偏移**：err 取值数 ≥ 3 且极差 ≥ 8px —— "恒定 −88px"那类 bug 的正面指纹；
+ *   · **单调**：编辑器采样位置递增 ⇒ 预览 scrollTop 不回弹；
+ *   · **反向跟手**：把锚点贴到预览视口顶后，编辑器必须把同一行拉回顶（±1 行）；
+ *   · **末尾贴底**：编辑器滚到底 ⇒ 预览滚到上限，且内容末端贴住视口底（≤ 40px）；
+ *   · 顶部对齐"数学上不可达"的样本（顶部对齐目标可能越过预览上限）不计入 t/符号门槛，
+ *     并要求可用样本 ≥ 6 个，防止"全靠不可达样本"把门槛架空。
  *
  * 运行：
  *   node test/browser/scroll-sync-accuracy.test.cjs
@@ -37,9 +41,12 @@ if (SKIP_REASON || !CHROME_PATH || !fs.existsSync(CHROME_PATH)) {
 }
 const puppeteer = { launch };
 
-// 样本门槛（px）。历史 88px 常量偏移会双双失败；正常实现应远低于此。
-const MEDIAN_MAX = 16;
-const ABS_MAX = 48;
+// 门槛常量（全部作用于"绝对度量"，不依赖实现内部映射函数）
+const T_MAX = 1;        // t = |err| / 局部括号跨度：锚点不得越过整个括号
+const REV_MAX = 40;     // 反向跟手：编辑器落点与目标行的像素差（≈1 行）
+const TAIL_MAX = 40;    // 末尾：预览内容末端距视口底（≈ 底部内边距 16px + 余量）
+const MIN_USABLE = 5;   // 可用样本下限（防止"全靠不可达样本"架空门槛）
+const MIN_SPREAD = 8;   // err 极差下限（"恒定常量偏移"的正面指纹）
 
 // 刻意混排「块高 ≠ 行数」的元素：代码块/表格/列表/引用/长段落，让逐行线性插值的残差暴露出来
 function buildDemo() {
@@ -224,76 +231,165 @@ function assert(name, cond, detail) {
     cm.scrollTo(0, H); await settle();
     cm.scrollTo(0, 0); await settle();
 
-    const out = [];
-    for (const f of [0.06, 0.2, 0.35, 0.5, 0.65, 0.8, 0.92]) {
-      const pick = anchors[Math.min(anchors.length - 1, Math.floor(anchors.length * f))];
-      cm.scrollTo(0, cm.heightAtLine(pick.line - 1, 'local'));   // 该行行首对齐编辑器视口顶
+    const lines = [...firstByLine.keys()].sort((a, b) => a - b);
+    // 与实现同源：≤ 给定行的最大锚点行（_anchorPairByLine 的左侧锚点）
+    const atOrAbove = (line) => {
+      let best = null;
+      for (const x of lines) if (x <= line && (best == null || x > best)) best = x;
+      return best;
+    };
+    const pvMax = Math.round(pv.scrollHeight - pv.clientHeight);
+    const pvClientH = Math.round(pv.clientHeight);
+
+    const sample = async (f) => {
+      const pick = lines[Math.min(lines.length - 1, Math.floor(lines.length * f))];
+      cm.scrollTo(0, cm.heightAtLine(pick - 1, 'local'));   // 该行行首对齐编辑器视口顶
       const settled = await settle();
       const si = cm.getScrollInfo();
-      // ⚠ 基准取「落定后实际的视口顶行」，不是「我们打算滚到的行」：
-      //   scrollTo 落到整数像素，而 lineAtHeight 在行边界处的取整可能差一行；
-      //   若按"打算的行"去取元素，会量到相邻整块的高度（CI 上曾表现为恒定 −86px）。
-      const line = cm.lineAtHeight(si.top, 'local') + 1;
-      const el = firstByLine.get(line) || firstByLine.get(pick.line);
-      const rect = el.getBoundingClientRect();
-      const pvMax = Math.round(pv.scrollHeight - pv.clientHeight);
-      const edDist = Math.round(si.height - (si.top + si.clientHeight));
-      out.push({
-        line, pickLine: pick.line, lineDelta: line - pick.line,
-        blockH: Math.round(rect.height),
-        // 绝对度量：该锚点 DOM 顶部相对预览视口顶的距离。不用任何内部表/映射函数。
-        err: Math.round((rect.top - pv.getBoundingClientRect().top) * 10) / 10,
-        settled,
+      // ⚠ 基准取「落定后**实际**的视口顶行」，不是"我打算滚到的行"：
+      //   对离屏行 scrollTo 用的是估算行高，落点常差 1~2 行；按"打算的行"取元素会凭空多出
+      //   1~2 行的假误差（实测曾把正确实现量成恒定 −86px / −709px）。
+      const realTop = cm.lineAtHeight(si.top, 'local') + 1;
+      const aLine = atOrAbove(realTop);                      // ★ 与实现同源
+      const a = aLine != null ? firstByLine.get(aLine) : null;
+      if (!a) return null;
+      const nl = lines.find((x) => x > aLine);
+      const b = nl != null ? firstByLine.get(nl) : null;
+      const pvTop = pv.getBoundingClientRect().top;
+      const rA = a.getBoundingClientRect();
+      const err = Math.round((rA.top - pvTop) * 10) / 10;    // 绝对度量，不用任何内部表/函数
+      const span = b ? Math.round(b.getBoundingClientRect().top - rA.top) : null;
+      const anchorTop = Math.round(rA.top - pvTop + pv.scrollTop);   // 锚点在预览内容坐标系里的绝对位置
+      return {
+        pickLine: pick, realTop, aLine, lineDelta: realTop - pick,
+        blockH: Math.round(rA.height), err, span,
+        t: span ? Math.round((Math.abs(err) / span) * 100) / 100 : null,
+        // 顶部对齐目标可能越过预览上限 ⇒ 该点落在"顶部对齐数学上不可达"的区段
+        // （推导见 preview-sync.js「末尾区段」注释），量它没有意义
+        tailRisk: span != null && (anchorTop + span) > pvMax + 0.5,
         clamped: Math.round(pv.scrollTop) >= pvMax - 1,
-        pvClientH: Math.round(pv.clientHeight), edDist,
-        edTop: Math.round(si.top), pvTop: Math.round(pv.scrollTop),
+        pvTop: Math.round(pv.scrollTop), settled,
+      };
+    };
+
+    // ① 正向采样（中前段，避开尾部不可达区）
+    const out = [];
+    for (const f of [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85]) out.push(await sample(f));
+
+    // ② 反向：把某锚点贴到预览视口顶 → 编辑器必须把同一源码行拉回顶
+    const rev = [];
+    for (const f of [0.25, 0.5, 0.75]) {
+      const L = lines[Math.min(lines.length - 1, Math.floor(lines.length * f))];
+      const a = firstByLine.get(L);
+      if (!a) continue;
+      const base = pv.getBoundingClientRect().top - pv.scrollTop;
+      const off = a.getBoundingClientRect().top - base;      // 锚点在预览内容里的绝对偏移
+      if (off > pvMax - 2) continue;                         // 超出可滚上限的样本跳过
+      pv.scrollTop = off;
+      const settled = await settle();
+      const cmTop = cm.getScrollInfo().top;
+      const expectTop = cm.heightAtLine(L - 1, 'local');
+      rev.push({
+        anchorLine: L, expectTop: Math.round(expectTop), cmTop: Math.round(cmTop),
+        diffPx: Math.round(cmTop - expectTop), settled,
       });
     }
 
+    // ③ 末尾：编辑器到底 → 预览必须滚到上限，且内容末端贴住视口底
+    cm.scrollTo(0, cm.getScrollInfo().height);
+    await settle();
+    const siEnd = cm.getScrollInfo();
+    const kids = [...pv.children].filter((e) => !e.classList.contains('pv-spacer'));
+    const lastEl = kids.length ? kids[kids.length - 1] : null;
+    const tail = {
+      edAtBottom: siEnd.top + siEnd.clientHeight >= siEnd.height - 1,
+      pvTop: Math.round(pv.scrollTop), pvMax,
+      contentGap: lastEl ? Math.round(pv.getBoundingClientRect().bottom - lastEl.getBoundingClientRect().bottom) : null,
+      lastTag: lastEl ? lastEl.tagName : '(无子元素)',
+    };
+
     return {
-      out,
+      out, rev, tail,
       docLines: cm.lineCount(),
       anchorCount: anchors.length,
-      previewScrollable: Math.round(pv.scrollHeight - pv.clientHeight),
+      previewScrollable: pvMax, pvClientH,
       editorScrollable: Math.round(H - cm.getScrollInfo().clientHeight),
     };
   });
 
   for (const s of res.out) {
-    console.log(`  行 ${String(s.line).padStart(4)}（目标 ${s.pickLine}, Δ${s.lineDelta}）`
-      + ` → err=${String(s.err).padStart(7)}px  块高=${s.blockH}`
-      + `  editorTop=${s.edTop}  previewTop=${s.pvTop}`
-      + (s.clamped ? '  (预览已贴底：不计入精度门槛)' : '')
+    if (!s) { console.log('  ⚠ 采样失败（该位置无锚点），已跳过'); continue; }
+    console.log(`  行 ${String(s.realTop).padStart(4)}（目标 ${s.pickLine}, Δ${s.lineDelta}）`
+      + ` → err=${String(s.err).padStart(7)}px  跨度=${String(s.span).padStart(4)}  t=${String(s.t).padStart(4)}`
+      + `  块高=${String(s.blockH).padStart(4)}  pvTop=${s.pvTop}`
+      + (s.tailRisk ? '  (顶部对齐可能越界：不计 t/符号门槛)' : '')
+      + (s.clamped ? '  (预览已贴底)' : '')
       + (s.settled ? '' : '  ⚠ 未落定'));
   }
 
-  // 只对「预览未贴底」的样本设精度门槛：预览一旦到达可滚上限（scrollTop = max），映射按设计
-  // 被固定住（该区段顶部对齐数学上不可达，推导见 preview-sync.js 的"末尾区段"注释），
-  // 此时量"锚点是否在预览视口顶"没有意义。另要求未贴底样本 ≥5 个，防止"全靠贴底"架空门槛。
-  const usable = res.out.filter(o => !o.clamped && o.settled);
-  const clampedCount = res.out.filter(o => o.clamped).length;
+  // 可用样本：未落定 / 已贴底 / 顶部对齐不可达 的样本都排除，并要求数量足够
+  const usable = res.out.filter(o => o && !o.clamped && !o.tailRisk && o.settled && o.span);
   const errs = usable.map(o => o.err);
   const abs = errs.map(Math.abs).sort((a, b) => a - b);
   const median = abs.length ? abs[Math.floor(abs.length / 2)] : null;
   const max = abs.length ? abs[abs.length - 1] : null;
+  const tMax = usable.length ? Math.max(...usable.map(o => o.t)) : null;
+  const distinct = new Set(errs).size;
+  const spread = abs.length ? Math.round((abs[abs.length - 1] - abs[0]) * 10) / 10 : null;
+  const overshoot = usable.length ? Math.max(...usable.map(o => o.err)) : null;
 
   console.log(`\n[判定] 文档 ${res.docLines} 行 / 锚点 ${res.anchorCount} 个；`
-    + `可滚范围 编辑器 ${res.editorScrollable}px、预览 ${res.previewScrollable}px`);
-  console.log(`  计入门槛的样本 ${usable.length}/${res.out.length} 个（其中预览贴底 ${clampedCount} 个）`);
+    + `可滚范围 编辑器 ${res.editorScrollable}px、预览 ${res.previewScrollable}px（预览视口 ${res.pvClientH}px）`);
+  console.log(`  可用样本 ${usable.length}/${res.out.length}｜|err| 中位 ${median}px、最大 ${max}px`
+    + `｜t 最大 ${tMax}｜不同 err 值 ${distinct} 个｜极差 ${spread}px`);
 
   bump(assert('文档与锚点数量足够（前提）',
     res.docLines > 80 && res.anchorCount > 20, `${res.docLines} 行 / ${res.anchorCount} 锚点`));
   bump(assert('编辑器与预览都有可滚动范围（前提）',
     res.editorScrollable > 200 && res.previewScrollable > 200,
     `编辑器 ${res.editorScrollable}px / 预览 ${res.previewScrollable}px`));
-  bump(assert('每个采样点都完成了同步落定', res.out.every(o => o.settled),
-    res.out.map(o => o.settled ? 'ok' : 'X').join('')));
-  bump(assert('至少 5 个样本未贴底（否则门槛形同虚设）', usable.length >= 5,
-    `未贴底 ${usable.length} / 共 ${res.out.length}`));
-  bump(assert(`未贴底样本：中位对齐误差 ≤ ${MEDIAN_MAX}px`,
-    median != null && median <= MEDIAN_MAX, `中位 ${median}px，全部=[${errs.join(', ')}]`));
-  bump(assert(`未贴底样本：最大对齐误差 ≤ ${ABS_MAX}px（远小于历史 88px 常量偏移）`,
-    max != null && max <= ABS_MAX, `最大 ${max}px`));
+  bump(assert('每个采样点都完成了同步落定', res.out.every(o => o && o.settled),
+    res.out.map(o => (o && o.settled) ? 'ok' : 'X').join('')));
+  bump(assert(`可用样本 ≥ ${MIN_USABLE}（否则门槛形同虚设）`, usable.length >= MIN_USABLE,
+    `可用 ${usable.length} / 共 ${res.out.length}`));
+
+  // ① 核心不变量：锚点必须落在"该行所在括号"之内（容差受局部跨度约束 ⇒ 常量偏移会越界）
+  bump(assert(`t ≤ ${T_MAX}：锚点不会比预览视口顶高出一个括号跨度（历史 −88px 常量偏移在此失败）`,
+    tMax != null && tMax <= T_MAX, `t 最大 ${tMax}`));
+
+  // ② 无常量偏移：err 必须随样本变化（"恒定 −88px"那类 bug 的正面指纹）
+  bump(assert(`err 非常数：取值数 ≥ 3 且极差 ≥ ${MIN_SPREAD}px`,
+    distinct >= 3 && spread != null && spread >= MIN_SPREAD, `取值 ${distinct} 个、极差 ${spread}px`));
+
+  // ③ 符号：顶部对齐 ⇒ 锚点不应落到视口顶下方（容 8px 取整误差）
+  bump(assert('锚点不落在预览视口顶下方（err ≤ 8px）', overshoot != null && overshoot <= 8,
+    `最大 err ${overshoot}px`));
+
+  // ④ 单调：编辑器越往下，预览不允许回弹
+  const seq = res.out.filter(o => o && o.settled).map(o => o.pvTop);
+  const monotone = seq.every((v, i) => i === 0 || v >= seq[i - 1] - 1);
+  bump(assert('单调：编辑器采样位置递增时，预览 scrollTop 不回弹', monotone, seq.join(' → ')));
+
+  // ⑤ 反向跟手：锚点贴预览顶 ⇒ 编辑器把同一源码行拉回顶（±1 行）
+  console.log('\n[反向] 预览 → 编辑器');
+  for (const o of res.rev) {
+    console.log(`  锚点行 ${String(o.anchorLine).padStart(4)} → 期望 cmTop ${o.expectTop}、实测 ${o.cmTop}`
+      + `（差 ${o.diffPx}px）` + (o.settled ? '' : '  ⚠ 未落定'));
+  }
+  const revUse = res.rev.filter(o => o.settled);
+  const revWorst = revUse.length ? Math.max(...revUse.map(o => Math.abs(o.diffPx))) : null;
+  bump(assert('反向可用样本 ≥ 2', revUse.length >= 2, `${revUse.length} 个`));
+  bump(assert(`反向跟手：|差px| ≤ ${REV_MAX}px（≈1 行）`,
+    revWorst != null && revWorst <= REV_MAX, revWorst == null ? '无样本' : `最大 ${revWorst}px`));
+
+  // ⑥ 末尾贴底：编辑器到底 ⇒ 预览滚到上限 + 内容末端贴住视口底
+  console.log('\n[末尾] ' + JSON.stringify(res.tail));
+  bump(assert('编辑器确实到底（前置）', res.tail.edAtBottom === true, `edAtBottom=${res.tail.edAtBottom}`));
+  bump(assert('编辑器到底时预览滚到上限（底部对齐）',
+    res.tail.pvTop >= res.tail.pvMax - 1, `pvTop ${res.tail.pvTop} / max ${res.tail.pvMax}`));
+  bump(assert(`预览内容末端贴住视口底（≤ ${TAIL_MAX}px）`,
+    res.tail.contentGap != null && res.tail.contentGap <= TAIL_MAX,
+    `末端距底 ${res.tail.contentGap}px（最后子元素 ${res.tail.lastTag}）`));
 
   if (pageErrors.length) {
     console.log('\n[页面运行时错误] ' + pageErrors.slice(0, 8).join(' | '));
