@@ -249,14 +249,13 @@ test('format: 光标在围栏代码块内 → 新块插到该代码块之后（�
     setContent(ed, '```mermaid\ngraph TD; A-->B;\n```\n\ntail');
     ed.cm.setCursor({ line: 1, ch: 3 });          // 光标落在围栏块内部
     ed.executeMenuAction('insert-mermaid');
-    const text = ed.cm.getValue();
-    const firstOpen = text.indexOf('```mermaid');
-    const firstClose = text.indexOf('```', firstOpen + 3);
-    const secondOpen = text.indexOf('```mermaid', firstClose + 3);
-    assert.ok(firstClose !== -1 && secondOpen !== -1, '应得到两个独立代码块：' + JSON.stringify(text));
-    assert.strictEqual(text.slice(firstOpen, firstClose).indexOf('```'), -1,
-      '第一个块内不得出现第二个围栏（即没有发生嵌套）：' + JSON.stringify(text));
-    assert.ok(text.indexOf('graph TD; A-->B;') < firstClose, '原图源码应留在第一个块内');
+    // 按**行结构**断言：嵌套形态下第 2 行会被新块劈成 "gra" + 新块，第 3 行也不再是闭合围栏。
+    const lines = ed.cm.getValue().split('\n');
+    assert.strictEqual(lines[0], '```mermaid', '首块开口围栏应在第 1 行：' + JSON.stringify(lines));
+    assert.strictEqual(lines[1], 'graph TD; A-->B;', '原图源码必须原样留在首块内（未被新块劈开）');
+    assert.strictEqual(lines[2], '```', '首块应在第 3 行正常闭合（说明新块没有嵌进去）');
+    assert.ok(lines.slice(3).some((l) => l.indexOf('```mermaid') === 0), '新块应出现在首块之后');
+    assert.ok(lines.some((l) => l === 'tail'), '原文档其余内容必须保留');
   } finally { cleanup(w); }
 });
 

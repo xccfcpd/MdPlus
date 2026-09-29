@@ -1927,23 +1927,26 @@
       // 几十条、一篇文档几百条（2026-09-29 实测一份控制台日志 838 条，占全部噪音 ~99%）。
       // 而它只是"跳过该节点"，**不影响 Word 输出**（提前剥掉这些节点与让它自己忽略，产物等价）。
       // 故：转换期间按前缀吞掉这类消息，结束时汇总成**一条**——刷屏没了，信息也没丢。
-      _collectMmlNoise() {
-        if (typeof console === 'undefined') return { restore() {} };
+      // con 可注入（测试用假 console）：app 代码运行在 jsdom 的独立上下文里，它的 console
+      // 与测试进程的 console 不是同一个对象；不传则用当前环境的 console（生产行为不变）。
+      _collectMmlNoise(con) {
+        const consoleRef = con || (typeof console !== 'undefined' ? console : null);
+        if (!consoleRef) return { restore() {} };
         const counts = new Map();
-        const orig = { warn: console.warn, error: console.error };
+        const orig = { warn: consoleRef.warn, error: consoleRef.error };
         const wrap = (level) => function (...args) {
           let head = '';
           for (const a of args) { if (typeof a === 'string') { head = a; break; } }
           const m = /^\s*Type not supported:\s*(\S+)/.exec(head);
           if (m) { counts.set(m[1], (counts.get(m[1]) || 0) + 1); return; }
-          return orig[level].apply(console, args);
+          return orig[level].apply(consoleRef, args);
         };
-        console.warn = wrap('warn');
-        console.error = wrap('error');
+        consoleRef.warn = wrap('warn');
+        consoleRef.error = wrap('error');
         return {
           restore() {
-            console.warn = orig.warn;
-            console.error = orig.error;
+            consoleRef.warn = orig.warn;
+            consoleRef.error = orig.error;
             if (!counts.size) return;
             const parts = [];
             let total = 0;

@@ -371,46 +371,38 @@ test('exportWord: mml2omml 的 Type not supported 被汇总成一条，其它日
   await withEditor({}, async (w, ed) => {
     assert.ok(typeof ed._collectMmlNoise === 'function', '_collectMmlNoise 应存在');
     const seen = [];
-    const origWarn = console.warn;
-    const origErr = console.error;
-    console.warn = (...a) => { seen.push('warn:' + a.map(String).join(' ')); };
-    console.error = (...a) => { seen.push('err:' + a.map(String).join(' ')); };
-    try {
-      const guard = ed._collectMmlNoise();
-      console.warn('Type not supported: annotation');
-      console.warn('Type not supported: annotation');
-      console.error('Type not supported: mpadded');
-      console.warn('其它消息应原样通过');
-      guard.restore();
+    // 注入假 console：app 代码运行在 jsdom 的独立上下文里，它的 console 与测试进程的
+    // console 不是同一个对象（CI 实测：直接改测试里的 console.warn 拦不到被测代码）。
+    const fake = {
+      warn: (...a) => { seen.push('warn:' + a.map(String).join(' ')); },
+      error: (...a) => { seen.push('err:' + a.map(String).join(' ')); },
+    };
+    const guard = ed._collectMmlNoise(fake);
+    fake.warn('Type not supported: annotation');
+    fake.warn('Type not supported: annotation');
+    fake.error('Type not supported: mpadded');
+    fake.warn('其它消息应原样通过');
+    guard.restore();
 
-      assert.deepStrictEqual(seen.filter((s) => s.indexOf('Type not supported') !== -1), [],
-        '逐条噪音必须被吞掉（否则等于没修）');
-      const summary = seen.filter((s) => s.indexOf('已忽略 mml2omml 不支持的 MathML 节点') !== -1);
-      assert.strictEqual(summary.length, 1, '应汇总成恰好一条，实际 ' + summary.length);
-      assert.ok(summary[0].indexOf('annotation×2') !== -1 && summary[0].indexOf('mpadded×1') !== -1,
-        '汇总应带分类计数：' + summary[0]);
-      assert.ok(seen.some((s) => s.indexOf('其它消息应原样通过') !== -1),
-        '非该前缀的日志必须原样放行（否则会吞掉真正的错误）');
-    } finally {
-      console.warn = origWarn;
-      console.error = origErr;
-    }
+    assert.deepStrictEqual(seen.filter((s) => s.indexOf('Type not supported') !== -1), [],
+      '逐条噪音必须被吞掉（否则等于没修）');
+    const summary = seen.filter((s) => s.indexOf('已忽略 mml2omml 不支持的 MathML 节点') !== -1);
+    assert.strictEqual(summary.length, 1, '应汇总成恰好一条，实际 ' + summary.length);
+    assert.ok(summary[0].indexOf('annotation×2') !== -1 && summary[0].indexOf('mpadded×1') !== -1,
+      '汇总应带分类计数：' + summary[0]);
+    assert.ok(seen.some((s) => s.indexOf('其它消息应原样通过') !== -1),
+      '非该前缀的日志必须原样放行（否则会吞掉真正的错误）');
   });
 });
 
 test('exportWord: 未出现 mml2omml 噪音时不打任何汇总（避免无谓日志）', async () => {
   await withEditor({}, async (w, ed) => {
     const seen = [];
-    const origWarn = console.warn;
-    console.warn = (...a) => { seen.push(a.map(String).join(' ')); };
-    try {
-      const guard = ed._collectMmlNoise();
-      console.warn('普通提示');
-      guard.restore();
-      assert.strictEqual(seen.filter((s) => s.indexOf('已忽略 mml2omml') !== -1).length, 0,
-        '没有噪音时不应打汇总');
-    } finally {
-      console.warn = origWarn;
-    }
+    const fake = { warn: (...a) => { seen.push(a.map(String).join(' ')); }, error: () => {} };
+    const guard = ed._collectMmlNoise(fake);
+    fake.warn('普通提示');
+    guard.restore();
+    assert.strictEqual(seen.filter((s) => s.indexOf('已忽略 mml2omml') !== -1).length, 0,
+      '没有噪音时不应打汇总');
   });
 });
