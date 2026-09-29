@@ -235,3 +235,52 @@ test('format: 点击格式工具栏下拉项后菜单强制隐藏，鼠标移出
     assert.ok(!menu.classList.contains('force-hide'), '鼠标移出后 force-hide 应被清除');
   } finally { cleanup(w); }
 });
+
+// ── 回归：光标在围栏代码块内时，工具栏插入不得把新块嵌进去（2026-09-29）──────────────
+// 背景：insertBlock 是「在光标处插入」（不是行尾）。若光标停在已有 ``` 块内部，新块会嵌进那个块
+//   ⇒ 外层块内容变成 "```d2 …" ⇒ 交给 Mermaid 就是
+//   "No diagram type detected matching given configuration for text: ```d2"。
+//   实测日志里三条 Mermaid 报错的文本逐条增大（仅 d2 → d2+markmap → 再吞进 $$/\label 区段），
+//   正是「内容被不断吸进同一个外层块」的形态。
+// 修复：插入点改到该围栏块的**闭合行行尾**（format.js 的 _fenceBlockEndAt）。
+test('format: 光标在围栏代码块内 → 新块插到该代码块之后（不嵌套）', async () => {
+  const { w, ed } = await makeEditor();
+  try {
+    setContent(ed, '```mermaid\ngraph TD; A-->B;\n```\n\ntail');
+    ed.cm.setCursor({ line: 1, ch: 3 });          // 光标落在围栏块内部
+    ed.executeMenuAction('insert-mermaid');
+    const text = ed.cm.getValue();
+    const firstOpen = text.indexOf('```mermaid');
+    const firstClose = text.indexOf('```', firstOpen + 3);
+    const secondOpen = text.indexOf('```mermaid', firstClose + 3);
+    assert.ok(firstClose !== -1 && secondOpen !== -1, '应得到两个独立代码块：' + JSON.stringify(text));
+    assert.strictEqual(text.slice(firstOpen, firstClose).indexOf('```'), -1,
+      '第一个块内不得出现第二个围栏（即没有发生嵌套）：' + JSON.stringify(text));
+    assert.ok(text.indexOf('graph TD; A-->B;') < firstClose, '原图源码应留在第一个块内');
+  } finally { cleanup(w); }
+});
+
+test('format: 围栏未闭合（写到一半）时插入点退到文末，同样不嵌进去', async () => {
+  const { w, ed } = await makeEditor();
+  try {
+    setContent(ed, '```mermaid\ngraph TD; A-->B;');   // 故意不闭合
+    ed.cm.setCursor({ line: 1, ch: 3 });
+    ed.executeMenuAction('insert-mermaid');
+    const text = ed.cm.getValue();
+    const second = text.indexOf('```mermaid', text.indexOf('```mermaid') + 3);
+    assert.ok(second > text.indexOf('graph TD; A-->B;'),
+      '未闭合围栏内插入应退到文末：' + JSON.stringify(text));
+  } finally { cleanup(w); }
+});
+
+test('format: 光标在普通正文内 → 插入行为不变（不误改既有语义）', async () => {
+  const { w, ed } = await makeEditor();
+  try {
+    setContent(ed, '第一段');
+    ed.cm.setCursor({ line: 0, ch: 3 });
+    ed.executeMenuAction('insert-code-block');
+    const text = ed.cm.getValue();
+    assert.ok(text.indexOf('第一段\n\n```') === 0,
+      '普通行内插入应保持「先空两行再插入」的既有行为：' + JSON.stringify(text));
+  } finally { cleanup(w); }
+});

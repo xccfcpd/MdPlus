@@ -253,6 +253,10 @@ function processMath(preview, opts) {
         // 支持的定界符：`$…$`、`$$…$$` 与 ```math 围栏（见 guide）。
       ],
       throwOnError: false,
+      // strict: 'ignore' —— KaTeX 默认 'warn'：公式里出现中文 / 未知符号时**逐字符**打一条警告
+      // （实测 15 条，每条还拖着几十行栈；`$中文$` 在用户文档里很常见）。渲染结果与 'warn' 完全一致，
+      // 只是不再刷控制台；真正的语法错误仍由 throwOnError:false 渲染成红色错误块，可视反馈不丢。
+      strict: 'ignore',
       ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
       ignoredClasses: ['katex-ignore'],
       // 只信任指向文内锚点（#eq-N）的 \href —— 公式编号交叉引用所需。
@@ -412,6 +416,40 @@ function buildMermaidContainer(doc, code, themeKey, index, cachedHtml, sourceLin
   return container;
 }
 
+// ---- 图表失败：可读化 + 日志降噪（2026-09-29）--------------------------------
+// 为什么需要：Mermaid 解析失败原本只有一条英文栈（形如
+// `No diagram type detected matching given configuration for text: ```d2 ...`）。
+// 其中最高频的一类根本不是语法问题，而是**这个块被插进了上一个代码块内部**（源码里带着围栏）——
+// 成因见 format.js 的 _fenceBlockEndAt。这里把这一类单独识别出来，在预览里给出中文说明；
+// 其余情况保留**一条**可读日志即可。
+function hasFenceLine(text) {
+  return /(?:^|\n)[ \t]{0,3}(?:`{3,}|~{3,})/.test(String(text == null ? '' : text));
+}
+
+function addDiagramNote(container, message) {
+  if (!container || !container.parentNode) return false;
+  const doc = container.ownerDocument || (typeof document !== 'undefined' ? document : null);
+  if (!doc) return false;
+  if (container.dataset && container.dataset.fenceNote) return false;
+  if (container.dataset) container.dataset.fenceNote = '1';
+  const note = doc.createElement('div');
+  note.className = 'diagram-fallback-note';   // 与 PlantUML/D2 未转换提示同一样式（styles.css）
+  note.textContent = message;
+  container.parentNode.insertBefore(note, container);
+  return true;
+}
+
+// 同一条失败只报一次：编辑图表块时每次按键都会重渲染，原本同一条栈会反复刷屏（实测一次编辑 3 条）。
+const _diagramErrSeen = new Set();
+function logDiagramError(err, detail) {
+  const raw = err && (err.hash || err.message || err.str);
+  const key = String(raw == null ? err : raw).replace(/\s+/g, ' ').slice(0, 200);
+  if (_diagramErrSeen.has(key)) return false;
+  _diagramErrSeen.add(key);
+  if (typeof console !== 'undefined') console.error('[diagrams] Mermaid 渲染失败：' + key, detail || '');
+  return true;
+}
+
 // ① 同步：mermaid 系（含 PlantUML / D2 转换结果）占位。
 //    **命中缓存的当场复原成图**（连占位都不显示）—— 这是"滚动/打字重渲染不再闪一下"的关键：
 //    窗口切片重渲染时，视口里的图绝大多数都渲染过，复原全部发生在同一个同步任务里，
@@ -494,13 +532,22 @@ async function renderMermaidPlaceholders(pres, opts) {
       try {
         await mermaid.run({ nodes: alive.map(x => x.container) });
       } catch (e) {
-        if (typeof console !== 'undefined') console.error('Mermaid rendering error:', e);
+        // 可读化：内容里含围栏 ⇒ 直接告诉用户"这个块被插进了上一个代码块"，不再让他猜英文栈。
+        const t = (typeof opt.t === 'function') ? opt.t : null;
+        const msg = t ? t('diagramFenceNested')
+          : 'Diagram source contains ``` fences — move this block out of the outer code block.';
+        let nested = 0;
+        for (const x of alive) {
+          if (!hasFenceLine(x.container.getAttribute('data-code'))) continue;
+          if (addDiagramNote(x.container, msg)) nested++;
+        }
+        logDiagramError(e, nested ? ('已为 ' + nested + ' 个含围栏的块给出提示') : '');
       }
       // 让出主线程：让滚动 / 输入等用户事件有机会处理，长文档多图不再整段卡死
       await new Promise((r) => setTimeout(r, 0));
     }
   } catch (e) {
-    if (typeof console !== 'undefined') console.error('Mermaid rendering error:', e);
+    logDiagramError(e, '（mermaid 初始化阶段失败）');
   } finally {
     // 渲染结束（**无论成败**）都要摘掉 pending：失败时源码重新可见，便于用户排查语法。
     // 历史 bug：摘 pending 原本只在 try 内、紧跟 await 之后 —— 一旦 initialize / run 抛错，

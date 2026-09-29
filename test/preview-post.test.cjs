@@ -363,3 +363,58 @@ test('两阶段④：批次之间被新一轮渲染换掉的容器（脱离文�
     assert.deepStrictEqual(batches, [4], '只应渲染第一批；第二批的容器已脱离文档，不该送给 mermaid.run');
   } finally { global.mermaid = prev; }
 });
+
+// ── 图表失败可读化 + 日志降噪（2026-09-29）─────────────────────────────────────
+test('围栏嵌套：Mermaid 失败时给出可读提示（文案走 i18n 键 diagramFenceNested）', async () => {
+  const { preview } = createPreviewDom();
+  // 外层 mermaid 块的内容里带着内层围栏 —— 即「这个块被插进了上一个代码块内部」的形态
+  preview.innerHTML = '<pre><code class="language-mermaid">```d2\na -> b: 调用</code></pre>';
+  const restore = stubMermaid('fail');
+  try {
+    const t = (k) => (k === 'diagramFenceNested' ? 'NESTED-HINT' : k);
+    const jobs = PP.prepareDiagramPlaceholders(preview, { isDark: false, mermaidCache: new Map() });
+    await PP.renderDiagramPlaceholders(preview, jobs, { isDark: false, mermaidCache: new Map(), t });
+    const notes = preview.querySelectorAll('.diagram-fallback-note');
+    assert.strictEqual(notes.length, 1, '含围栏的失败块应恰好得到一条提示');
+    assert.strictEqual(notes[0].textContent, 'NESTED-HINT', '提示文案应取自 i18n 键 diagramFenceNested');
+    assert.ok(preview.querySelector('.diagram-container[data-diagram-type="mermaid"]'),
+      '容器应保留（用户要能看到源码，而不是空框）');
+  } finally { restore(); }
+});
+
+test('围栏嵌套：正常语法失败时不应误报「含围栏」提示', async () => {
+  const { preview } = createPreviewDom();
+  preview.innerHTML = '<pre><code class="language-mermaid">graph TD; A-->B;</code></pre>';
+  const restore = stubMermaid('fail');
+  try {
+    const jobs = PP.prepareDiagramPlaceholders(preview, { isDark: false, mermaidCache: new Map() });
+    await PP.renderDiagramPlaceholders(preview, jobs, { isDark: false, mermaidCache: new Map() });
+    assert.strictEqual(preview.querySelectorAll('.diagram-fallback-note').length, 0,
+      '内容里没有围栏时不得给出「嵌套」提示（否则是误报）');
+  } finally { restore(); }
+});
+
+test('日志降噪：同一条 Mermaid 失败重复渲染三次只报一次', async () => {
+  const { preview } = createPreviewDom();
+  const uniq = 'dedupe-probe-' + Date.now();
+  const seen = [];
+  const origErr = console.error;
+  const prevMermaid = global.mermaid;
+  console.error = (...a) => { seen.push(a.map(String).join(' ')); };
+  global.mermaid = {
+    initialize() {},
+    run: async () => { throw Object.assign(new Error(uniq), { hash: uniq }); },
+  };
+  try {
+    for (let i = 0; i < 3; i++) {
+      preview.innerHTML = '<pre><code class="language-mermaid">graph TD; A-->B;</code></pre>';
+      const jobs = PP.prepareDiagramPlaceholders(preview, { isDark: false, mermaidCache: new Map() });
+      await PP.renderDiagramPlaceholders(preview, jobs, { isDark: false, mermaidCache: new Map() });
+    }
+    const hits = seen.filter((s) => s.indexOf(uniq) !== -1);
+    assert.strictEqual(hits.length, 1, '同一失败重复三次只应留下一条日志，实际 ' + hits.length + ' 条');
+  } finally {
+    console.error = origErr;
+    global.mermaid = prevMermaid;
+  }
+});

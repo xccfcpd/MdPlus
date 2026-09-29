@@ -402,8 +402,56 @@
           cm.execCommand('newlineAndIndent');
         }
       },
+      // 判断某行是否处于「围栏代码块」内部；返回该块**闭合行**的行号（0 基），不在块内返回 -1。
+      //
+      // 为什么需要（2026-09-29 实测）：insertBlock 是**在光标处**插入（不是行尾）。若光标停在
+      // 已有的 ``` 围栏块内部（例如刚插入完一个图表块、光标还在块内，或手动把光标点进块里），
+      // 新块就会被**嵌进**那个块里 —— 外层块的内容变成 "```d2 ..."。该内容随后交给 Mermaid，
+      // 就是 "No diagram type detected matching given configuration for text: ```d2"。
+      // 实测日志里三条 Mermaid 报错的文本逐条增大（仅 d2 → d2+markmap → 再吞进 $$/\label 区段），
+      // 正是"内容被不断吸进同一个外层块"的形态。
+      //
+      // 扫描按 CommonMark 精简实现：
+      //   · 围栏 ≤3 空格缩进、连续 ≥3 个同字符（` 或 ~）；反引号围栏的 info string 不得再含反引号；
+      //   · 块**内**只认闭合行（内层 ``` 一律算内容）—— 这正是嵌套场景的语义。
+      _fenceBlockEndAt(line) {
+        const cm = this.cm;
+        if (!cm || typeof cm.lineCount !== 'function' || typeof cm.getLine !== 'function') return -1;
+        const count = cm.lineCount();
+        if (count <= 0) return -1;
+        const last = Math.min(Math.max(line, 0), count - 1);
+        let openCh = '';
+        let openLen = 0;
+        let closeRe = null;
+        for (let i = 0; i <= last; i++) {
+          const text = cm.getLine(i) || '';
+          if (!openCh) {
+            const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(text);
+            if (m && !(m[1].charAt(0) === '`' && m[2].indexOf('`') !== -1)) {
+              openCh = m[1].charAt(0);
+              openLen = m[1].length;
+              closeRe = new RegExp('^ {0,3}' + (openCh === '`' ? '`' : '~') + '{' + openLen + ',}[ \\t]*$');
+            }
+            continue;
+          }
+          if (closeRe.test(text)) { openCh = ''; openLen = 0; closeRe = null; }
+        }
+        if (!openCh) return -1;                       // 光标行不在任何围栏块内
+        for (let i = last + 1; i < count; i++) {      // 在块内 → 向后找闭合行
+          if (closeRe.test(cm.getLine(i) || '')) return i;
+        }
+        return count - 1;                             // 围栏未闭合（写到一半）：插到文末，绝不嵌进去
+      },
       insertBlock(text, cursorOffset) {
-        const cursor = this.cm.getCursor();
+        // 安全化：光标在围栏代码块内时，插入点改到该块闭合行行尾（见 _fenceBlockEndAt 的推导）。
+        // 只影响"工具栏块插入"，不影响手动打字；真正想在块内写内容时不受影响。
+        let cursor = this.cm.getCursor();
+        const fenceEnd = this._fenceBlockEndAt(cursor.line);
+        if (fenceEnd !== -1) {
+          const at = Math.min(fenceEnd, Math.max(0, this.cm.lineCount() - 1));
+          cursor = { line: at, ch: (this.cm.getLine(at) || '').length };
+          if (typeof this.setStatus === 'function') this.setStatus(this.t('blockInsertedOutsideFence'));
+        }
         const line = this.cm.getLine(cursor.line);
         const needNewline = line.trim() !== '';
         const prefix = needNewline ? '\n\n' : '';

@@ -1922,24 +1922,65 @@
         if (!sawMath) return true;
         return !!convert;
       },
+      // mml2omml（第三方 min 库）会对每个它不支持的 MathML 节点打一条 `Type not supported: X`。
+      // KaTeX 输出的每个公式都带 <annotation>（TeX 语义标注）与 <mpadded>（间距），于是一个公式
+      // 几十条、一篇文档几百条（2026-09-29 实测一份控制台日志 838 条，占全部噪音 ~99%）。
+      // 而它只是"跳过该节点"，**不影响 Word 输出**（提前剥掉这些节点与让它自己忽略，产物等价）。
+      // 故：转换期间按前缀吞掉这类消息，结束时汇总成**一条**——刷屏没了，信息也没丢。
+      _collectMmlNoise() {
+        if (typeof console === 'undefined') return { restore() {} };
+        const counts = new Map();
+        const orig = { warn: console.warn, error: console.error };
+        const wrap = (level) => function (...args) {
+          let head = '';
+          for (const a of args) { if (typeof a === 'string') { head = a; break; } }
+          const m = /^\s*Type not supported:\s*(\S+)/.exec(head);
+          if (m) { counts.set(m[1], (counts.get(m[1]) || 0) + 1); return; }
+          return orig[level].apply(console, args);
+        };
+        console.warn = wrap('warn');
+        console.error = wrap('error');
+        return {
+          restore() {
+            console.warn = orig.warn;
+            console.error = orig.error;
+            if (!counts.size) return;
+            const parts = [];
+            let total = 0;
+            counts.forEach((v, k) => { parts.push(k + '×' + v); total += v; });
+            orig.warn('[docx] 已忽略 mml2omml 不支持的 MathML 节点 ' + total + ' 个（'
+              + parts.join('、') + '）—— 属预期：这些节点本就渲染不进 Word，输出不受影响');
+          },
+        };
+      },
       // 同步版（既有契约不变，测试直接调用）：一次驱动生成器到结束。
       _structureMathmlToOmml(structure) {
-        const it = this._genMathmlToOmml(structure);
-        let res = it.next();
-        while (!res.done) res = it.next();
-        return res.value;
+        const noise = this._collectMmlNoise();
+        try {
+          const it = this._genMathmlToOmml(structure);
+          let res = it.next();
+          while (!res.done) res = it.next();
+          return res.value;
+        } finally {
+          noise.restore();   // 导出被取消/抛错也必须还原 console
+        }
       },
       // 异步分块版（导出主路径用）：每 20 个公式让出主线程一帧。公式多时逐条 mml2omml + 多次
       // DOMParser 会累积数秒同步卡顿；分块后 spinner 持续转、取消可响应。产出与同步版逐位一致。
       async _structureMathmlToOmmlChunked(structure) {
-        const it = this._genMathmlToOmml(structure);
-        let res = it.next();
-        let n = 0;
-        while (!res.done) {
-          res = it.next();
-          if (++n % 20 === 0) await new Promise((r) => setTimeout(r, 0));
+        const noise = this._collectMmlNoise();
+        try {
+          const it = this._genMathmlToOmml(structure);
+          let res = it.next();
+          let n = 0;
+          while (!res.done) {
+            res = it.next();
+            if (++n % 20 === 0) await new Promise((r) => setTimeout(r, 0));
+          }
+          return res.value;
+        } finally {
+          noise.restore();
         }
-        return res.value;
       },
       // 弹「导出 DOCX」确认框：只做说明 + 确认，返回 Promise<boolean>（true=开始导出）。
       // 纸张/方向/边距固定 A4/纵向/标准——Word 是页面模型需要这些值，但让用户在导出前选
