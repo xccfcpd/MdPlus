@@ -420,22 +420,35 @@ function buildMermaidContainer(doc, code, themeKey, index, cachedHtml, sourceLin
 // 为什么需要：Mermaid 解析失败原本只有一条英文栈（形如
 // `No diagram type detected matching given configuration for text: ```d2 ...`）。
 // 其中最高频的一类根本不是语法问题，而是**这个块被插进了上一个代码块内部**（源码里带着围栏）——
-// 成因见 format.js 的 _fenceBlockEndAt。这里把这一类单独识别出来，在预览里给出中文说明；
-// 其余情况保留**一条**可读日志即可。
+// 成因见 format.js 的 _fenceBlockEndAt。
+// 对这一类，除了中文说明，还要**把原始源码放回容器**：Mermaid 失败时会把自己的"错误炸弹图"塞进
+// 容器，源码就此被顶掉，用户没地方复制去修（原实现期望的"失败时源码重新可见"在真实内核下不成立）。
+// 结构与 diagram-renderers.js 的 renderError 保持一致（.diagram-error + .diagram-error-msg +
+// <pre><code>），复用既有样式与"宁可看见源码，也不能把内容藏起来"的原则。
+// 其余失败保持原行为，只留**一条**可读日志。
 function hasFenceLine(text) {
   return /(?:^|\n)[ \t]{0,3}(?:`{3,}|~{3,})/.test(String(text == null ? '' : text));
 }
 
-function addDiagramNote(container, message) {
-  if (!container || !container.parentNode) return false;
+function restoreDiagramSource(container, message) {
+  if (!container || !container.classList) return false;
   const doc = container.ownerDocument || (typeof document !== 'undefined' ? document : null);
   if (!doc) return false;
-  if (container.dataset && container.dataset.fenceNote) return false;
-  if (container.dataset) container.dataset.fenceNote = '1';
-  const note = doc.createElement('div');
-  note.className = 'diagram-fallback-note';   // 与 PlantUML/D2 未转换提示同一样式（styles.css）
-  note.textContent = message;
-  container.parentNode.insertBefore(note, container);
+  if (container.dataset && container.dataset.fenceSource) return false;   // 幂等：重渲染不重复插入
+  if (container.dataset) container.dataset.fenceSource = '1';
+  const code = container.getAttribute('data-code') || '';
+  container.classList.add('diagram-error');
+  container.classList.remove('diagram-pending');
+  container.textContent = '';                    // 清掉 Mermaid 的错误炸弹图
+  const msg = doc.createElement('div');
+  msg.className = 'diagram-error-msg';
+  msg.textContent = message;
+  const pre = doc.createElement('pre');
+  const codeEl = doc.createElement('code');
+  codeEl.textContent = code;                     // 纯文本：可选中复制
+  pre.appendChild(codeEl);
+  container.appendChild(msg);
+  container.appendChild(pre);
   return true;
 }
 
@@ -532,16 +545,16 @@ async function renderMermaidPlaceholders(pres, opts) {
       try {
         await mermaid.run({ nodes: alive.map(x => x.container) });
       } catch (e) {
-        // 可读化：内容里含围栏 ⇒ 直接告诉用户"这个块被插进了上一个代码块"，不再让他猜英文栈。
+        // 可读化：内容里含围栏 ⇒ 说明 + 把源码放回容器（Mermaid 的错误图会把源码顶掉）。
         const t = (typeof opt.t === 'function') ? opt.t : null;
         const msg = t ? t('diagramFenceNested')
           : 'Diagram source contains ``` fences — move this block out of the outer code block.';
-        let nested = 0;
+        let restored = 0;
         for (const x of alive) {
           if (!hasFenceLine(x.container.getAttribute('data-code'))) continue;
-          if (addDiagramNote(x.container, msg)) nested++;
+          if (restoreDiagramSource(x.container, msg)) restored++;
         }
-        logDiagramError(e, nested ? ('已为 ' + nested + ' 个含围栏的块给出提示') : '');
+        logDiagramError(e, restored ? ('已把 ' + restored + ' 个含围栏块的源码放回预览') : '');
       }
       // 让出主线程：让滚动 / 输入等用户事件有机会处理，长文档多图不再整段卡死
       await new Promise((r) => setTimeout(r, 0));

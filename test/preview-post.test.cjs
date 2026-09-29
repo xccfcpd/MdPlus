@@ -365,32 +365,39 @@ test('两阶段④：批次之间被新一轮渲染换掉的容器（脱离文�
 });
 
 // ── 图表失败可读化 + 日志降噪（2026-09-29）─────────────────────────────────────
-test('围栏嵌套：Mermaid 失败时给出可读提示（文案走 i18n 键 diagramFenceNested）', async () => {
+test('围栏嵌套：Mermaid 失败时给出说明 + 把原始源码放回容器（可复制）', async () => {
   const { preview } = createPreviewDom();
   // 外层 mermaid 块的内容里带着内层围栏 —— 即「这个块被插进了上一个代码块内部」的形态
-  preview.innerHTML = '<pre><code class="language-mermaid">```d2\na -> b: 调用</code></pre>';
+  const code = '```d2\na -> b: 调用';
+  preview.innerHTML = '<pre><code class="language-mermaid">' + code + '</code></pre>';
   const restore = stubMermaid('fail');
   try {
     const t = (k) => (k === 'diagramFenceNested' ? 'NESTED-HINT' : k);
     const jobs = PP.prepareDiagramPlaceholders(preview, { isDark: false, mermaidCache: new Map() });
     await PP.renderDiagramPlaceholders(preview, jobs, { isDark: false, mermaidCache: new Map(), t });
-    const notes = preview.querySelectorAll('.diagram-fallback-note');
-    assert.strictEqual(notes.length, 1, '含围栏的失败块应恰好得到一条提示');
-    assert.strictEqual(notes[0].textContent, 'NESTED-HINT', '提示文案应取自 i18n 键 diagramFenceNested');
-    assert.ok(preview.querySelector('.diagram-container[data-diagram-type="mermaid"]'),
-      '容器应保留（用户要能看到源码，而不是空框）');
+    const c = preview.querySelector('.diagram-container[data-diagram-type="mermaid"]');
+    assert.ok(c, '容器应保留（用户要能看到源码，而不是空框）');
+    assert.ok(c.classList.contains('diagram-error'), '含围栏的失败应进入错误态（.diagram-error）');
+    const msg = c.querySelector('.diagram-error-msg');
+    assert.ok(msg, '应有说明元素（.diagram-error-msg）');
+    assert.strictEqual(msg.textContent, 'NESTED-HINT', '说明文案应取自 i18n 键 diagramFenceNested');
+    const codeEl = c.querySelector('pre code');
+    assert.ok(codeEl, '应把源码放回容器（<pre><code>），便于就地复制修改');
+    assert.strictEqual(codeEl.textContent, code, '放回的必须是**原始**源码');
   } finally { restore(); }
 });
 
-test('围栏嵌套：正常语法失败时不应误报「含围栏」提示', async () => {
+test('围栏嵌套：正常语法失败时不走这条（不误报、不改动容器内容）', async () => {
   const { preview } = createPreviewDom();
   preview.innerHTML = '<pre><code class="language-mermaid">graph TD; A-->B;</code></pre>';
   const restore = stubMermaid('fail');
   try {
     const jobs = PP.prepareDiagramPlaceholders(preview, { isDark: false, mermaidCache: new Map() });
     await PP.renderDiagramPlaceholders(preview, jobs, { isDark: false, mermaidCache: new Map() });
-    assert.strictEqual(preview.querySelectorAll('.diagram-fallback-note').length, 0,
-      '内容里没有围栏时不得给出「嵌套」提示（否则是误报）');
+    assert.strictEqual(preview.querySelectorAll('.diagram-error-msg').length, 0,
+      '内容里没有围栏时不得给「嵌套」说明（否则是误报）');
+    assert.strictEqual(preview.querySelectorAll('.diagram-container.diagram-error').length, 0,
+      '也不应把它标成该类错误态（保持原有行为）');
   } finally { restore(); }
 });
 
