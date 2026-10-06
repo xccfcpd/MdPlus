@@ -11,6 +11,23 @@ use tauri::menu::{Menu, MenuItem};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use md5::{Md5, Digest};
 
+// 编译期嵌入的打包文档：便携版 exe 不随附 resources/ 目录时，仍可打开「使用说明 / 演示文档」。
+// 路径相对本源文件（src-tauri/src/lib.rs）：../../ = 仓库根；../../src = 仓库根/src。
+// 说明：demo.md 目前仅有中文版，但即便界面切成英文，也直接展示这份中文 demo 即可。
+const DEMO_MD: &str = include_str!("../../demo.md");
+const GUIDE_MD: &str = include_str!("../../src/guide.md");
+const GUIDE_EN_MD: &str = include_str!("../../src/guide.en.md");
+
+// 根据文件名返回编译期嵌入的文档内容（资源文件未随附时兜底）。
+fn embedded_bundled(filename: &str) -> Option<&'static str> {
+    match filename {
+        "demo.md" => Some(DEMO_MD),
+        "guide.md" => Some(GUIDE_MD),
+        "guide.en.md" => Some(GUIDE_EN_MD),
+        _ => None,
+    }
+}
+
 fn show_window(window: &tauri::WebviewWindow) {
     let _ = window.unminimize();
     let _ = window.show();
@@ -207,6 +224,20 @@ fn read_bundled_file(app: tauri::AppHandle, filename: String) -> Result<serde_js
                 "path": dev_path.to_string_lossy().to_string(),
             }));
         }
+    }
+    // 便携版 exe 不随附 resources/ 目录、且非源码根 dev 环境时，回退到编译期嵌入内容，
+    // 保证「使用说明 / 演示文档」在单文件便携版下也能打开。path 仍用资源目录路径，
+    // 以便 processImages 的相对图片解析（这些文档本身无图片引用，仅保持接口一致）。
+    if let Some(content) = embedded_bundled(&filename) {
+        let resource_path = app
+            .path()
+            .resolve(&filename, BaseDirectory::Resource)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| filename.clone());
+        return Ok(serde_json::json!({
+            "content": decode_bytes(content.as_bytes()),
+            "path": resource_path,
+        }));
     }
     Err(format!(
         "{{\"kind\":\"NotFound\",\"path\":\"{}\",\"message\":\"bundled file not found: {}\"}}",
