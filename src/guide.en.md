@@ -14,7 +14,7 @@ TizuMark's interface has the following areas:
 
 | Area | Position | Purpose |
 |------|----------|---------|
-| **Top Toolbar** | Top | File / View / Help menus, view toggle, reload, theme, window controls |
+| **Top Toolbar** | Top | File / Help menus, view toggle (preview/edit), reload, theme, window controls; sidebar toggled by a left-edge floating handle |
 | **Format Toolbar** | Below the top bar | Common formatting buttons and dropdown groups, collapsible |
 | **Sidebar** | Left | File tree (top) & outline (bottom), drag the divider to resize |
 | **Editor** | Center | CodeMirror with Markdown syntax highlighting and auto-closing brackets / quotes; breadcrumb navigation on top |
@@ -64,7 +64,7 @@ The two tabs in the center toolbar toggle the view; <kbd>Ctrl</kbd> + <kbd>\\</k
 
 ### Sidebar: Files & Outline
 
-Click `View → Sidebar` to show or hide the sidebar. It is split into a **Files** panel (top) and an **Outline** panel (bottom); drag the divider between them to resize, and either panel can be collapsed.
+Click the floating handle centered on the left window edge to show or hide the sidebar. It is split into a **Files** panel (top) and an **Outline** panel (bottom); drag the divider between them to resize, and either panel can be collapsed.
 
 **Files panel** (shown after opening a directory with `File → Open Folder`):
 

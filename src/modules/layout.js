@@ -7,7 +7,7 @@
 
   const mixin = {
       initOutline() {
-        // 侧边栏关闭统一由「视图 → 侧边栏」菜单（toggleSidebar）控制，不再保留顶部关闭栏。
+        // 侧边栏开合统一由左缘悬浮把手（#sidebar-handle → toggleSidebar）控制，不再保留顶部关闭栏。
         const outlineSidebar = document.getElementById('outline-sidebar');
         if (!outlineSidebar) return;
       },
@@ -68,8 +68,8 @@
       updateSidebarChecks() {
         const sidebar = document.getElementById('outline-sidebar');
         const visible = !sidebar.classList.contains('hidden');
-        const sidebarToggle = document.getElementById('btn-sidebar-toggle');
-        if (sidebarToggle) sidebarToggle.classList.toggle('checked', visible);
+        const handle = document.getElementById('sidebar-handle');
+        if (handle) handle.classList.toggle('open', visible);
       },
       initPanelHeaders() {
         const filesChevron = document.getElementById('files-chevron');
@@ -960,6 +960,8 @@
       document.getElementById('btn-view-edit').addEventListener('click', () => this.setViewMode('edit'));
       document.getElementById('btn-side-left').addEventListener('click', () => this.toggleCollapse('editor'));
       document.getElementById('btn-side-right').addEventListener('click', () => this.toggleCollapse('preview'));
+      const sidebarHandle = document.getElementById('sidebar-handle');
+      if (sidebarHandle) sidebarHandle.addEventListener('click', () => this.toggleSidebar());
       document.getElementById('large-file-banner-close').addEventListener('click', () => {
         this.hideLargeFileNotice();
         this._largeFileNoticeDismissed = true;

@@ -239,7 +239,7 @@ class MarkdownEditor {
   initMenuButtons() {
     const F = 'file-menu';
     const H = 'help-menu';
-    this._bindMenuAction('btn-sidebar-toggle', () => this.toggleSidebar());
+
     this._bindMenuAction('btn-new', () => this.newFile(), F);
     this._bindMenuAction('btn-add-tab', () => this.newFile());
     this._bindMenuAction('btn-open', () => this.openFile(), F);

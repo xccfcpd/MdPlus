@@ -81,7 +81,6 @@
       linkMedia: '链接与媒体',
       link: '链接',
       image: '图片',
-      view: '视图',
       outline: '大纲',
       outlineFilter: '大纲层级',
       outlineFilterAll: '全部',
@@ -614,7 +613,7 @@
       linkMedia: 'Links & Media',
       link: 'Link',
       image: 'Image',
-      view: 'View',
+
       outline: 'Outline',
       outlineFilter: 'Outline level',
       outlineFilterAll: 'All',

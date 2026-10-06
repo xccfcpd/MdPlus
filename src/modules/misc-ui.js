@@ -781,7 +781,6 @@
     initToolbarMenus() {
       const toolbarDropdowns = [
         { btn: 'btn-file', menu: 'file-menu' },
-        { btn: 'btn-view', menu: 'view-menu' },
         { btn: 'btn-help', menu: 'help-menu' },
       ];
 
