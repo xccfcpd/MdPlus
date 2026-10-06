@@ -57,10 +57,21 @@ fn set_window_behavior(show_tray: bool, app: tauri::AppHandle) {
     }
 }
 
+// 统一退出入口：先清掉 TrayState 持有的 TrayIcon 引用（触发 Drop 真正移除托盘图标），
+// 再退出。app.exit 的 cleanup_before_exit 只清 manager/resources 里的克隆，清不到
+// app.manage(TrayState) 持有的那份引用，进程退出跳过 Drop → 托盘图标残留
+// （Windows 上表现为僵尸图标，鼠标掠过才消失），反复开关退出会累积多个。
+fn exit_app(app: &tauri::AppHandle) {
+    if let Ok(mut tray_guard) = app.state::<TrayState>().0.lock() {
+        *tray_guard = None;
+    }
+    app.exit(0);
+}
+
 // 前端调此命令真正退出应用（关窗弹框选"退出"时调用）。
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    exit_app(&app);
 }
 
 // 路径安全校验：拒绝写入/创建到系统关键目录或越界路径。
@@ -330,7 +341,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<TrayIcon> {
                     }
                 }
                 "quit" => {
-                    app.exit(0);
+                    exit_app(app);
                 }
                 _ => {}
             }
@@ -1395,7 +1406,7 @@ pub fn run() {
                 let show_tray = *app.state::<WindowBehavior>().show_tray.lock().unwrap();
                 // 无托盘时直接退出（否则窗口将无法恢复）
                 if !show_tray {
-                    app.exit(0);
+                    exit_app(&app);
                 } else {
                     api.prevent_close();
                     let _ = window.emit("close-requested", ());
